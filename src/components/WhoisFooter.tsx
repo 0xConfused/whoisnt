@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import React from 'react';
+
+export const WhoisFooter: React.FC = () => {
+  return (
+    <footer
+      id="site-footer"
+      className="no-print site-footer mt-12 w-full border-t border-[#383838] bg-[#090909] text-[#8c8c8c] font-mono text-xs relative"
+    >
+      <div className="wrap footer-wrap">
+        <div className="footer-primary-row">
+          <div className="footer-identity font-mono">
+            <a
+              href="https://www.0xconfused.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="footer-handle font-glitch font-normal cursor-pointer transition-colors no-underline"
+            >
+              0xCONFUSED
+            </a>
+            <span className="footer-sep">/</span>
+            <span className="footer-name font-mono text-[#f0f0f0]">./whoisnt</span>
+            <span className="footer-sep">//</span>
+            <span className="footer-role" title="WHOIS & OSINT Difference Engine">
+              WHOIS &amp; OSINT Difference Engine
+            </span>
+          </div>
+
+          <div className="footer-links font-mono">
+            <span
+              className="footer-spec hover:text-[#8c8c8c] transition-colors cursor-default"
+              title="SPDX-License-Identifier: AGPL-3.0-or-later"
+            >
+              AGPL-3.0-or-later
+            </span>
+          </div>
+        </div>
+      </div>
+    </footer>
+  );
+};
