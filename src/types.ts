@@ -7,20 +7,13 @@ export interface VerificationTokenItem {
 }
 
 export interface WhoisDomainRecord {
-  queryInput: string;
   domainName: string;
   rootDomain: string;
-  tld: string;
-  fetchedAt: number;
   source: 'rdap' | 'whois' | 'doh';
 
   // Registrar & Authority
   registrar: string;
-  ianaId?: string;
-  whoisServer?: string;
-  registrarUrl?: string;
   abuseContactEmail?: string;
-  abuseContactPhone?: string;
 
   // Lifecycle & Dates
   createdDate?: string;
@@ -30,20 +23,16 @@ export interface WhoisDomainRecord {
   domainAgeFormatted?: string;
   daysUntilExpiration?: number;
   expirationStatus?: 'active' | 'expiring-soon' | 'expired' | 'unknown';
-  isSignificantAgeDiscrepancy?: boolean;
-  isSignificantExpirationDiscrepancy?: boolean;
 
   // Security & EPP status flags
   status: string[];
-  dnssec: 'signed' | 'unsigned' | 'delegated' | 'unknown';
+  dnssec: 'signed' | 'unsigned';
 
   // Nameservers & Infrastructure
   nameservers: string[];
-  nameserverRoots?: string[];
   dnsProvider?: string;
   aRecords?: string[];
   aaaaRecords?: string[];
-  mxRecords?: string[];
   mailProvider?: string;
   soaRecord?: string;
   soaMname?: string;
@@ -56,32 +45,37 @@ export interface WhoisDomainRecord {
   registrantOrg?: string;
   registrantCountry?: string;
   registrantState?: string;
-  registrantCity?: string;
-  isPrivacyProtected?: boolean;
 
   // OSINT: BGP & Autonomous System Network
   asn?: string;
   asnName?: string;
-  bgpPrefix?: string;
   subnet24?: string;
 
-  // OSINT: Live TLS Handshake Inspection
+  // OSINT: Passive DNS (Historical Resolutions)
+  passiveDnsDisplay?: string[];
+  passiveDnsIps?: string[];
+
+  // OSINT: Live TLS Handshake & Certificate Inspection
   tlsSubjectCn?: string;
   tlsSubjectOrg?: string;
   tlsIssuerOrg?: string;
   tlsIssuerCn?: string;
   tlsProtocol?: string;
   tlsCipher?: string;
-  tlsFingerprint256?: string;
-  tlsSans?: string[];
+  tlsValidityNotBefore?: string;
+  tlsValidityNotAfter?: string;
 
-  // OSINT: Certificate Transparency (crt.name / crt.sh)
+  // OSINT: Certificate Transparency (crt.name / Certspotter)
   crtSubdomainsCount?: number;
   crtSubdomainsSample?: string[];
   crtWildcardFound?: boolean;
 
   // OSINT: Attribution & Verification Fingerprints
   verificationTokens?: VerificationTokenItem[];
+  htmlVerificationTokens?: VerificationTokenItem[];
+  analyticsIds?: string[];
+  footerCopyrights?: string[];
+  copyrightEntities?: string[];
   spfRecord?: string;
   spfIncludes?: string[];
   spfIpMechanisms?: string[];
@@ -95,15 +89,35 @@ export interface WhoisDomainRecord {
   dsRecords?: string[];
   dnskeyRecords?: string[];
 
-  // OSINT: Web Infrastructure
+  // OSINT: Web Infrastructure, Headers, DOM, Resources & Tech Stack (Static/Inert Analysis Only)
   httpWebServer?: string;
   httpStatusCode?: number;
-  hstsEnabled?: boolean;
-  cspPresent?: boolean;
+  httpHeaderSummary?: string[];
+  cspExternalDomains?: string[];
+  webReconMode?: 'server-direct' | 'browser-cors' | 'cors-blocked' | 'unreachable';
+  webFinalUrl?: string;
+  inspectedScriptsCount?: number;
 
-  // Raw & Metadata
+  // HTML Metadata & DOM Inspection
+  htmlTitle?: string;
+  htmlDescription?: string;
+  htmlGenerator?: string;
+  htmlAuthor?: string;
+  htmlRobots?: string;
+  canonicalUrl?: string;
+  openGraphSiteName?: string;
+  twitterSite?: string;
+  domMarkers?: string[];
+  domStats?: string;
+
+  // Script URLs, Resource Enumeration, Technologies & External Domains
+  scriptUrls?: string[];
+  resourceSummary?: string[];
+  technologies?: string[];
+  externalDomains?: string[];
+
+  // Raw Buffer
   rawText: string;
-  error?: string;
 }
 
 export type DiffStatus = 'MATCH' | 'DIFF' | 'ONLY_A' | 'ONLY_B';
@@ -116,7 +130,7 @@ export type OsintCategory =
   | 'registrar'
   | 'security'
   | 'lifecycle'
-  | 'identity';
+  | 'web';
 
 export interface FieldDiffItem {
   id: string;
@@ -127,9 +141,7 @@ export interface FieldDiffItem {
   valueB: string | string[] | null | undefined;
   status: DiffStatus;
   deltaSummary?: string;
-  impactLevel: 'high' | 'medium' | 'low';
   isLowImpact?: boolean;
-  isAttributionPivot?: boolean;
 }
 
 export interface TextDiffLine {
@@ -150,15 +162,10 @@ export interface WhoisDiffSummary {
   totalFieldsCompared: number;
   divergentCount: number;
   matchingCount: number;
-  highImpactCount: number;
-  lowImpactCount: number;
   ageDeltaFormatted?: string;
   expirationDeltaFormatted?: string;
-  hasSignificantAgeDiscrepancy: boolean;
-  hasSignificantExpirationDiscrepancy: boolean;
   sharedNameserversCount: number;
   totalNameserversCount: number;
-  sharedEppCount: number;
   sameRegistrar: boolean;
   sameDnsProvider: boolean;
   sameMailProvider: boolean;
@@ -166,18 +173,16 @@ export interface WhoisDiffSummary {
   sameSubnet24: boolean;
   sameTlsSubjectOrg: boolean;
   sharedVerificationTokensCount: number;
-  sharedCtSubdomains: string[];
+  sharedAnalyticsIds?: string[];
+  sharedCopyrightEntities?: string[];
+  sharedExternalDomains?: string[];
+  sharedPassiveDnsIps?: string[];
   sameSoaRname?: boolean;
-  sameSoaMname?: boolean;
   sharedPtrHostnames?: string[];
   sharedSpfIps?: string[];
   sameDmarcRua?: boolean;
   sameDmarcRuf?: boolean;
   sharedDkimTargets?: string[];
-  createdDeltaSeconds?: number;
-  updatedDeltaSeconds?: number;
-  isCreationClustered?: boolean;
-  isUpdateClustered?: boolean;
   linkages: SharedLinkageInsight[];
   overallAttributionVerdict: 'CONFIRMED_SHARED_OWNERSHIP' | 'LIKELY_AFFILIATED' | 'SHARED_CLOUD_INFRASTRUCTURE' | 'DISTINCT_INDEPENDENT_ENTITIES';
 }

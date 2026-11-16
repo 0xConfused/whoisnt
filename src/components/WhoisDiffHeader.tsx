@@ -84,7 +84,6 @@ export const WhoisDiffHeader: React.FC<WhoisDiffHeaderProps> = ({
               href="https://www.0xconfused.com/"
               target="_blank"
               rel="noopener noreferrer"
-              data-bypass-warning="true"
               className="brand-logo-link block w-full h-full"
               aria-label="0xCONFUSED Website"
             >
@@ -106,7 +105,6 @@ export const WhoisDiffHeader: React.FC<WhoisDiffHeaderProps> = ({
                   href="https://www.0xconfused.com/"
                   target="_blank"
                   rel="noopener noreferrer"
-                  data-bypass-warning="true"
                   className="no-underline text-inherit inline-block"
                   aria-label="0xCONFUSED Website"
                 >
@@ -143,7 +141,7 @@ export const WhoisDiffHeader: React.FC<WhoisDiffHeaderProps> = ({
             </span>
             <span
               id="crawler-status-badge"
-              className={`text-xs font-mono font-bold ${
+              className={`inline-flex items-center gap-1.5 text-xs font-mono font-bold ${
                 isComparing
                   ? 'text-[#c30800]'
                   : hasDiffData
@@ -151,6 +149,16 @@ export const WhoisDiffHeader: React.FC<WhoisDiffHeaderProps> = ({
                   : 'text-[#8c8c8c]'
               }`}
             >
+              <span
+                aria-hidden="true"
+                className={`w-2 h-2 shrink-0 ${
+                  isComparing
+                    ? 'bg-[#c30800] animate-pulse'
+                    : hasDiffData
+                    ? 'bg-[#bbc300]'
+                    : 'bg-[#737373]'
+                }`}
+              />
               {isComparing ? 'ANALYZING' : hasDiffData ? 'READY' : 'STANDBY'}
             </span>
           </div>

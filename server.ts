@@ -8,6 +8,15 @@ import net from 'net';
 import { createServer as createViteServer } from 'vite';
 import { canonicalizeJsonStringify } from './src/utils/jsonSort';
 import { parseFlexibleDateMs } from './src/utils/dateUtils';
+import {
+  analyzeHtmlRecon,
+  extractAnalyticsIdsFromText,
+  MAX_HTML_RECON_BYTES,
+  MAX_SCRIPT_TEXT_BYTES,
+  readBoundedResponseText,
+  sanitizeHttpHeaders,
+  selectFirstPartyScriptsForInspection,
+} from './src/utils/htmlRecon';
 
 const app = express();
 const PORT = 3000;
@@ -249,7 +258,7 @@ async function safeFetch(
   let redirectsCount = 0;
   const redirectChain: string[] = [initialUrl];
   const seenHops = new Set<string>();
-  seenHops.add(cleanUrl(initialUrl, undefined, false, true) || initialUrl);
+  seenHops.add(cleanUrl(initialUrl) || initialUrl);
 
   const { maxRedirects: _, validateRedirect, userIdentifier, ...fetchOpts } = options;
 
@@ -312,7 +321,7 @@ async function safeFetch(
         throw new Error(`SSRF blocked: Redirect target points to private or local host (${nextParsed.hostname})`);
       }
 
-      const normalizedNext = cleanUrl(nextUrl, undefined, false, true) || nextUrl;
+      const normalizedNext = cleanUrl(nextUrl) || nextUrl;
       // Fast loop breaker: abort immediately on circular redirect cycle
       if (seenHops.has(normalizedNext)) {
         throw new CircularRedirectError(redirectChain, nextUrl, res.status);
@@ -354,7 +363,7 @@ async function safeFetch(
   }
 }
 
-function cleanUrl(rawUrl: string, _baseDomain?: string, stripQuery = true, stripHash = true): string | null {
+function cleanUrl(rawUrl: string): string | null {
   try {
     let urlStr = rawUrl.trim();
     if (!/^https?:\/\//i.test(urlStr)) {
@@ -373,13 +382,8 @@ function cleanUrl(rawUrl: string, _baseDomain?: string, stripQuery = true, strip
       parsed.port = '';
     }
 
-    if (stripHash) {
-      parsed.hash = '';
-    }
-
-    if (stripQuery) {
-      parsed.search = '';
-    } else if (parsed.search) {
+    parsed.hash = '';
+    if (parsed.search) {
       // Parameter sorting: canonical parameter ordering
       parsed.searchParams.sort();
     }
@@ -526,12 +530,10 @@ function readVcardScalar(val: unknown): string {
 
 function parseRdapData(rdapData: any, domain: string, rootDomain: string) {
   let registrarName = '';
-  let ianaId = '';
   let abuseContact = '';
   let registrantOrg = '';
   let registrantCountry = '';
   let registrantState = '';
-  let registrantCity = '';
 
   const searchEntities = (entities: any[]) => {
     if (!Array.isArray(entities)) return;
@@ -549,14 +551,6 @@ function parseRdapData(rdapData: any, domain: string, rootDomain: string) {
           if (!registrarName && orgVal) registrarName = orgVal;
         }
         if (!registrarName && ent.handle) registrarName = String(ent.handle);
-        if (Array.isArray(ent.publicIds)) {
-          const ianaPublicId = ent.publicIds.find(
-            (p: any) => p && typeof p.type === 'string' && p.type.toLowerCase().includes('iana')
-          );
-          if (ianaPublicId && ianaPublicId.identifier !== undefined) {
-            ianaId = String(ianaPublicId.identifier);
-          }
-        }
       }
       if (roles.includes('abuse')) {
         if (vcardProps) {
@@ -580,7 +574,6 @@ function parseRdapData(rdapData: any, domain: string, rootDomain: string) {
           }
           const adrItem = vcardProps.find((i: any) => Array.isArray(i) && i[0] === 'adr');
           if (adrItem && Array.isArray(adrItem[3])) {
-            if (adrItem[3][4]) registrantCity = readVcardScalar(adrItem[3][4]) || String(adrItem[3][3] || '');
             if (adrItem[3][5]) registrantState = String(adrItem[3][5]);
             if (adrItem[3][6]) registrantCountry = String(adrItem[3][6]);
           }
@@ -641,18 +634,15 @@ function parseRdapData(rdapData: any, domain: string, rootDomain: string) {
     rootDomain,
     queryDomain: domain,
     registrar: registrarName || rdapData.port43 || 'Unknown / Protected',
-    ianaId: ianaId || undefined,
     createdDate: createdDate || undefined,
     updatedDate: updatedDate || undefined,
     expiresDate: expiresDate || undefined,
     status,
     nameservers,
-    whoisServer: rdapData.port43 || undefined,
     abuseContact: abuseContact || undefined,
     registrantOrg: registrantOrg || undefined,
     registrantCountry: registrantCountry || undefined,
     registrantState: registrantState || undefined,
-    registrantCity: registrantCity || undefined,
     source: 'rdap' as const,
     rawText: canonicalizeJsonStringify(rdapData).slice(0, 50000),
   };
@@ -744,8 +734,6 @@ function parseWhoisText(rawText: string, domain: string, rootDomain: string) {
     registrar = 'EDUCAUSE';
   }
 
-  const ianaId = findMatch(/^[ \t]*(?:Registrar IANA ID|IANA ID|Registrar IANA):[^\S\r\n]+([^\r\n]+)/im);
-
   const createdDate =
     findMatch(/^[ \t]*(?:Creation Date|Created On|Registration Date|Registered On|Registered on|Domain record activated|created|registered|\[Registered Date\]|\[Created on\]):?[^\S\r\n]+([^\r\n]+)/im) ||
     findMatch(/^[ \t]*\[Connected Date\][^\S\r\n]+([^\r\n]+)/im);
@@ -761,7 +749,6 @@ function parseWhoisText(rawText: string, domain: string, rootDomain: string) {
     if (jprsStateExp) expiresDate = jprsStateExp;
   }
 
-  const whoisServer = findMatch(/^[ \t]*(?:Registrar WHOIS Server|WHOIS Server|whois):[^\S\r\n]+([^\r\n]+)/im);
   const abuseContact = findMatch(/^[ \t]*(?:Registrar Abuse Contact Email|Abuse Contact Email|abuse-mailbox|Registrar Abuse Contact):[^\S\r\n]+([^\r\n]+)/im);
   const registrantCountry = findMatch(/^[ \t]*(?:Registrant Country|Country|registrant-country):[^\S\r\n]+([^\r\n]+)/im);
   const registrantOrg = findMatch(/^[ \t]*(?:Registrant Organization|g\.\s*\[Organization\]|organisation):?[^\S\r\n]+([^\r\n]+)/im);
@@ -800,13 +787,11 @@ function parseWhoisText(rawText: string, domain: string, rootDomain: string) {
     rootDomain,
     queryDomain: domain,
     registrar: registrar || 'Protected / Not Disclosed',
-    ianaId,
     createdDate,
     updatedDate,
     expiresDate,
     status,
     nameservers,
-    whoisServer,
     abuseContact,
     registrantOrg,
     registrantCountry,
@@ -1030,7 +1015,7 @@ async function fetchCrtNameSubdomains(apexDomain: string, userAgentOrReq?: strin
   }
 }
 
-async function lookupIpAsn(ip: string): Promise<{ asn?: string; asnName?: string; bgpPrefix?: string; subnet24?: string } | null> {
+async function lookupIpAsn(ip: string): Promise<{ asn?: string; asnName?: string; subnet24?: string } | null> {
   if (!ip || !ip.includes('.')) return null;
   const octets = ip.split('.');
   if (octets.length !== 4) return null;
@@ -1043,7 +1028,6 @@ async function lookupIpAsn(ip: string): Promise<{ asn?: string; asnName?: string
     const line = txts[0].join('');
     const parts = line.split('|').map((s) => s.trim());
     const rawAsn = parts[0] || '';
-    const prefix = parts[1] || '';
     const asn = rawAsn ? `AS${rawAsn}` : undefined;
 
     let asnName: string | undefined;
@@ -1061,7 +1045,6 @@ async function lookupIpAsn(ip: string): Promise<{ asn?: string; asnName?: string
     return {
       asn,
       asnName,
-      bgpPrefix: prefix || undefined,
       subnet24,
     };
   } catch {
@@ -1076,8 +1059,8 @@ async function inspectLiveTlsCert(hostname: string): Promise<{
   tlsIssuerCn?: string;
   tlsProtocol?: string;
   tlsCipher?: string;
-  tlsFingerprint256?: string;
-  tlsSans?: string[];
+  tlsValidityNotBefore?: string;
+  tlsValidityNotAfter?: string;
 }> {
   return new Promise((resolve) => {
     let resolved = false;
@@ -1097,14 +1080,6 @@ async function inspectLiveTlsCert(hostname: string): Promise<{
           const cipherInfo = socket.getCipher();
           const cipher = cipherInfo ? cipherInfo.name : undefined;
 
-          let sans: string[] = [];
-          if (cert && cert.subjectaltname) {
-            sans = cert.subjectaltname
-              .split(',')
-              .map((s) => s.trim().replace(/^DNS:/i, ''))
-              .filter(Boolean);
-          }
-
           socket.destroy();
           resolve({
             tlsSubjectCn: (cert?.subject && (cert.subject as any).CN) || undefined,
@@ -1113,8 +1088,8 @@ async function inspectLiveTlsCert(hostname: string): Promise<{
             tlsIssuerCn: (cert?.issuer && (cert.issuer as any).CN) || undefined,
             tlsProtocol: protocol || undefined,
             tlsCipher: cipher || undefined,
-            tlsFingerprint256: cert?.fingerprint256 || undefined,
-            tlsSans: sans.slice(0, 30),
+            tlsValidityNotBefore: cert?.valid_from || undefined,
+            tlsValidityNotAfter: cert?.valid_to || undefined,
           });
         } catch {
           socket.destroy();
@@ -1247,36 +1222,244 @@ async function extractAttributionAndVerification(domain: string): Promise<{
   };
 }
 
-async function probeWebServer(domain: string, userAgent: string): Promise<{
+async function probeWebPageAndHeaders(domain: string, userAgent: string): Promise<{
   httpWebServer?: string;
   httpStatusCode?: number;
-  hstsEnabled?: boolean;
-  cspPresent?: boolean;
+  httpHeaderSummary?: string[];
+  cspExternalDomains?: string[];
+  webReconMode: 'server-direct' | 'unreachable';
+  webFinalUrl?: string;
+  inspectedScriptsCount?: number;
+  htmlTitle?: string;
+  htmlDescription?: string;
+  htmlGenerator?: string;
+  htmlAuthor?: string;
+  htmlRobots?: string;
+  canonicalUrl?: string;
+  openGraphSiteName?: string;
+  twitterSite?: string;
+  htmlVerificationTokens?: Array<{ provider: string; token: string; raw: string }>;
+  domMarkers?: string[];
+  domStats?: string;
+  scriptUrls?: string[];
+  resourceSummary?: string[];
+  analyticsIds?: string[];
+  footerCopyrights?: string[];
+  copyrightEntities?: string[];
+  technologies?: string[];
+  externalDomains?: string[];
 }> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3500);
-    const res = await safeFetch(`https://${domain}`, {
-      method: 'HEAD',
-      headers: { 'User-Agent': userAgent },
-      signal: controller.signal,
-      maxRedirects: 3,
-    });
-    clearTimeout(timeout);
+  let res: Response | null = null;
+  let attemptUrl = `https://${domain}`;
 
-    const serverHeader = res.headers.get('server') || undefined;
-    const hsts = res.headers.has('strict-transport-security');
-    const csp = res.headers.has('content-security-policy');
+  for (const scheme of ['https', 'http']) {
+    attemptUrl = `${scheme}://${domain}`;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const r = await safeFetch(attemptUrl, {
+        method: 'GET',
+        headers: {
+          'User-Agent': userAgent,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+        signal: controller.signal,
+        maxRedirects: 4,
+      });
+      clearTimeout(timeout);
+      res = r;
+      break;
+    } catch {
+      res = null;
+    }
+  }
 
+  if (!res) {
+    return { webReconMode: 'unreachable' };
+  }
+
+  const finalUrl = ((res as any).finalUrl as string) || res.url || attemptUrl;
+  const sanitizedHeaders = sanitizeHttpHeaders(res.headers);
+  const serverHeader = sanitizedHeaders['server'] || undefined;
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+  const isHtmlLike =
+    !contentType ||
+    contentType.includes('text/html') ||
+    contentType.includes('application/xhtml') ||
+    contentType.includes('text/plain') ||
+    contentType.includes('application/xml') ||
+    contentType.includes('text/xml');
+
+  if (!isHtmlLike) {
+    try {
+      await res.body?.cancel();
+    } catch {}
+    const httpHeaderSummary = Object.keys(sanitizedHeaders)
+      .sort()
+      .map((k) => `${k}: ${sanitizedHeaders[k]}`);
     return {
       httpWebServer: serverHeader,
       httpStatusCode: res.status,
-      hstsEnabled: hsts,
-      cspPresent: csp,
+      httpHeaderSummary,
+      webReconMode: 'server-direct',
+      webFinalUrl: finalUrl,
     };
-  } catch {
-    return {};
   }
+
+  let htmlText = '';
+  try {
+    htmlText = await readBoundedResponseText(res, MAX_HTML_RECON_BYTES);
+  } catch {
+    htmlText = '';
+  }
+
+  const recon = analyzeHtmlRecon(htmlText, finalUrl, sanitizedHeaders, domain);
+
+  // Bounded first-party script UTF-8 text scan (strictly non-executed, SSRF-guarded)
+  const analyticsSet = new Set<string>(recon.analyticsIds);
+  const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, domain, 3);
+  let inspectedScriptsCount = 0;
+
+  if (candidateScripts.length > 0) {
+    const scriptResults = await Promise.allSettled(
+      candidateScripts.map(async (scriptUrl) => {
+        const sc = new AbortController();
+        const timer = setTimeout(() => sc.abort(), 2600);
+        try {
+          const sRes = await safeFetch(scriptUrl, {
+            method: 'GET',
+            headers: {
+              'User-Agent': userAgent,
+              Accept: 'application/javascript,text/javascript,text/plain,*/*;q=0.5',
+            },
+            signal: sc.signal,
+            maxRedirects: 2,
+          });
+          clearTimeout(timer);
+          if (!sRes.ok) return null;
+          const sCt = (sRes.headers.get('content-type') || '').toLowerCase();
+          if (sCt && !sCt.includes('javascript') && !sCt.includes('text/') && !sCt.includes('ecmascript') && !sCt.includes('json')) {
+            try {
+              await sRes.body?.cancel();
+            } catch {}
+            return null;
+          }
+          return await readBoundedResponseText(sRes, MAX_SCRIPT_TEXT_BYTES);
+        } catch {
+          clearTimeout(timer);
+          return null;
+        }
+      })
+    );
+
+    for (const r of scriptResults) {
+      if (r.status === 'fulfilled' && r.value) {
+        inspectedScriptsCount++;
+        const scriptAnalytics = extractAnalyticsIdsFromText(r.value);
+        scriptAnalytics.forEach((id) => analyticsSet.add(id));
+      }
+    }
+  }
+
+  return {
+    httpWebServer: serverHeader,
+    httpStatusCode: res.status,
+    httpHeaderSummary: recon.httpHeaderSummary,
+    cspExternalDomains: recon.cspExternalDomains,
+    webReconMode: 'server-direct',
+    webFinalUrl: finalUrl,
+    inspectedScriptsCount,
+    htmlTitle: recon.htmlTitle,
+    htmlDescription: recon.htmlDescription,
+    htmlGenerator: recon.htmlGenerator,
+    htmlAuthor: recon.htmlAuthor,
+    htmlRobots: recon.htmlRobots,
+    canonicalUrl: recon.canonicalUrl,
+    openGraphSiteName: recon.openGraphSiteName,
+    twitterSite: recon.twitterSite,
+    htmlVerificationTokens: recon.htmlVerificationTokens,
+    domMarkers: recon.domMarkers,
+    domStats: recon.domStats,
+    scriptUrls: recon.scriptUrls,
+    resourceSummary: recon.resourceSummary,
+    analyticsIds: Array.from(analyticsSet).sort(),
+    footerCopyrights: recon.footerCopyrights,
+    copyrightEntities: recon.copyrightEntities,
+    technologies: recon.technologies,
+    externalDomains: recon.externalDomains,
+  };
+}
+
+async function fetchServerPassiveDns(domain: string, rootDomain: string, userAgent: string): Promise<{
+  passiveDnsDisplay: string[];
+  passiveDnsIps: string[];
+}> {
+  const ipSet = new Set<string>();
+  const displaySet = new Set<string>();
+
+  const queryMnemonic = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3500);
+      const res = await safeFetch(`https://api.mnemonic.no/pdns/v3/${encodeURIComponent(domain)}?limit=25`, {
+        signal: controller.signal,
+        headers: { 'User-Agent': userAgent, Accept: 'application/json' },
+        maxRedirects: 2,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const json = await res.json();
+      if (!Array.isArray(json?.data)) return;
+      for (const item of json.data) {
+        const q = String(item.query || domain).toLowerCase();
+        const rr = String(item.rrtype || '').toUpperCase();
+        const ans = String(item.answer || '').trim();
+        if (!rr || !ans) continue;
+        const fsMs = Number(item.firstSeenTimestamp || item.createdTimestamp || 0);
+        const lsMs = Number(item.lastSeenTimestamp || item.lastUpdatedTimestamp || 0);
+        const firstSeen = fsMs > 0 ? new Date(fsMs).toISOString().slice(0, 10) : undefined;
+        const lastSeen = lsMs > 0 ? new Date(lsMs).toISOString().slice(0, 10) : undefined;
+        if ((rr === 'A' || rr === 'AAAA') && /^[\da-fA-F:.]+$/.test(ans)) {
+          ipSet.add(ans);
+        }
+        const span = firstSeen && lastSeen ? ` [${firstSeen}..${lastSeen}]` : firstSeen ? ` [${firstSeen}]` : '';
+        displaySet.add(`${rr} | ${q} -> ${ans}${span}`);
+      }
+    } catch {}
+  };
+
+  const queryHackerTarget = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3500);
+      const res = await safeFetch(`https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(rootDomain)}`, {
+        signal: controller.signal,
+        headers: { 'User-Agent': userAgent },
+        maxRedirects: 2,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const text = await res.text();
+      if (!text || text.includes('error') || text.includes('API count exceeded')) return;
+      const lines = text.split('\n').slice(0, 30);
+      for (const line of lines) {
+        const [hostRaw, ipRaw] = line.split(',');
+        const host = hostRaw?.trim().toLowerCase();
+        const ip = ipRaw?.trim();
+        if (!host || !ip) continue;
+        if (/^[\da-fA-F:.]+$/.test(ip)) ipSet.add(ip);
+        displaySet.add(`${ip.includes(':') ? 'AAAA' : 'A'} | ${host} -> ${ip}`);
+      }
+    } catch {}
+  };
+
+  await Promise.allSettled([queryMnemonic(), queryHackerTarget()]);
+
+  return {
+    passiveDnsDisplay: Array.from(displaySet).sort().slice(0, 40),
+    passiveDnsIps: Array.from(ipSet).sort(),
+  };
 }
 
 function inferMailProvider(mxRecords: string[]): string {
@@ -1347,7 +1530,6 @@ async function getCrtSubdomainSummary(apexDomain: string, userAgent: string): Pr
 async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Promise<any> {
   const cleanDomain = rawDomain.toLowerCase().trim().replace(/:\d+$/, '').replace(/^\.+|\.+$/g, '');
   const rootDomain = extractApexDomain(cleanDomain);
-  const tld = rootDomain.split('.').pop() || '';
 
   // Run comprehensive OSINT probes in parallel
   const [
@@ -1357,6 +1539,7 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     tlsResult,
     webProbeResult,
     crtResult,
+    passiveDnsResult,
   ] = await Promise.allSettled([
     resolveDomainWhoisAndRdap(cleanDomain, userAgent),
     Promise.allSettled([
@@ -1368,8 +1551,9 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     ]),
     extractAttributionAndVerification(cleanDomain),
     inspectLiveTlsCert(cleanDomain),
-    probeWebServer(cleanDomain, userAgent),
+    probeWebPageAndHeaders(cleanDomain, userAgent),
     getCrtSubdomainSummary(rootDomain, userAgent),
+    fetchServerPassiveDns(cleanDomain, rootDomain, userAgent),
   ]);
 
   const whoisData = whoisResult.status === 'fulfilled' ? whoisResult.value : null;
@@ -1411,7 +1595,7 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
   }
 
   // ASN and BGP Network Intelligence for first A record
-  let asnInfo: { asn?: string; asnName?: string; bgpPrefix?: string; subnet24?: string } | null = null;
+  let asnInfo: { asn?: string; asnName?: string; subnet24?: string } | null = null;
   if (aRecords.length > 0) {
     try {
       asnInfo = await lookupIpAsn(aRecords[0]);
@@ -1452,15 +1636,12 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     }
   }
 
-  // Nameserver roots & Provider inference
-  const nsRoots = Array.from(
-    new Set(nameservers.map((ns) => extractApexDomain(ns)))
-  );
+  // Provider inference
   const nsString = nameservers.join(' ').toLowerCase();
   let dnsProvider = 'Custom Infrastructure';
   if (nsString.includes('cloudflare.com')) dnsProvider = 'Cloudflare Managed DNS';
   else if (nsString.includes('awsdns') || nsString.includes('route53')) dnsProvider = 'Amazon Route 53';
-  else if (nsString.includes('googledomains') || nsString.includes('googlecloud')) dnsProvider = 'Google Cloud DNS';
+  else if (nsString.includes('googledomains.com') || nsString.includes('googlecloud')) dnsProvider = 'Google Cloud DNS';
   else if (nsString.includes('azure-dns')) dnsProvider = 'Microsoft Azure DNS';
   else if (nsString.includes('domaincontrol') || nsString.includes('godaddy')) dnsProvider = 'GoDaddy DNS';
   else if (nsString.includes('registrar-servers') || nsString.includes('namecheap')) dnsProvider = 'Namecheap DNS';
@@ -1474,19 +1655,15 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
   const tlsData = tlsResult.status === 'fulfilled' ? tlsResult.value : null;
   const webData = webProbeResult.status === 'fulfilled' ? webProbeResult.value : null;
   const crtData = crtResult.status === 'fulfilled' ? crtResult.value : null;
+  const pdnsData = passiveDnsResult.status === 'fulfilled' ? passiveDnsResult.value : null;
 
   return {
-    queryInput: rawDomain,
     domainName: cleanDomain,
     rootDomain,
-    tld,
-    fetchedAt: Date.now(),
     source: whoisData?.source || 'rdap',
 
     // Registrar & Authority
     registrar: whoisData?.registrar || 'Protected / Redacted',
-    ianaId: whoisData?.ianaId,
-    whoisServer: whoisData?.whoisServer,
     abuseContactEmail: whoisData?.abuseContact,
     createdDate,
     updatedDate: whoisData?.updatedDate,
@@ -1500,22 +1677,20 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
 
     // DNS & Infrastructure
     nameservers: nameservers.sort(),
-    nameserverRoots: nsRoots.sort(),
     dnsProvider,
     aRecords,
     aaaaRecords,
-    mxRecords,
     mailProvider,
     registrantOrg: (whoisData as any)?.registrantOrg,
     registrantCountry: (whoisData as any)?.registrantCountry,
     registrantState: (whoisData as any)?.registrantState,
-    registrantCity: (whoisData as any)?.registrantCity,
 
-    // OSINT Network
+    // OSINT Network & Passive DNS
     asn: asnInfo?.asn,
     asnName: asnInfo?.asnName,
-    bgpPrefix: asnInfo?.bgpPrefix,
     subnet24: asnInfo?.subnet24,
+    passiveDnsDisplay: pdnsData?.passiveDnsDisplay || [],
+    passiveDnsIps: pdnsData?.passiveDnsIps || [],
 
     // OSINT TLS
     tlsSubjectCn: tlsData?.tlsSubjectCn,
@@ -1524,8 +1699,8 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     tlsIssuerCn: tlsData?.tlsIssuerCn,
     tlsProtocol: tlsData?.tlsProtocol,
     tlsCipher: tlsData?.tlsCipher,
-    tlsFingerprint256: tlsData?.tlsFingerprint256,
-    tlsSans: tlsData?.tlsSans,
+    tlsValidityNotBefore: tlsData?.tlsValidityNotBefore,
+    tlsValidityNotAfter: tlsData?.tlsValidityNotAfter,
 
     // OSINT Certificate Transparency
     crtSubdomainsCount: crtData?.crtSubdomainsCount || 0,
@@ -1534,16 +1709,37 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
 
     // OSINT Attribution
     verificationTokens: attributionData?.verificationTokens || [],
+    htmlVerificationTokens: webData?.htmlVerificationTokens || [],
+    analyticsIds: webData?.analyticsIds || [],
+    footerCopyrights: webData?.footerCopyrights || [],
+    copyrightEntities: webData?.copyrightEntities || [],
     spfRecord: attributionData?.spfRecord,
     spfIncludes: attributionData?.spfIncludes || [],
     dmarcPolicy: attributionData?.dmarcPolicy,
     dmarcRua: attributionData?.dmarcRua,
 
-    // OSINT Web Server
+    // OSINT Web Server, Headers, DOM, Resources & Tech Stack
     httpWebServer: webData?.httpWebServer,
     httpStatusCode: webData?.httpStatusCode,
-    hstsEnabled: webData?.hstsEnabled,
-    cspPresent: webData?.cspPresent,
+    httpHeaderSummary: webData?.httpHeaderSummary || [],
+    cspExternalDomains: webData?.cspExternalDomains || [],
+    webReconMode: webData?.webReconMode,
+    webFinalUrl: webData?.webFinalUrl,
+    inspectedScriptsCount: webData?.inspectedScriptsCount || 0,
+    htmlTitle: webData?.htmlTitle,
+    htmlDescription: webData?.htmlDescription,
+    htmlGenerator: webData?.htmlGenerator,
+    htmlAuthor: webData?.htmlAuthor,
+    htmlRobots: webData?.htmlRobots,
+    canonicalUrl: webData?.canonicalUrl,
+    openGraphSiteName: webData?.openGraphSiteName,
+    twitterSite: webData?.twitterSite,
+    domMarkers: webData?.domMarkers || [],
+    domStats: webData?.domStats,
+    scriptUrls: webData?.scriptUrls || [],
+    resourceSummary: webData?.resourceSummary || [],
+    technologies: webData?.technologies || [],
+    externalDomains: webData?.externalDomains || [],
 
     rawText:
       whoisData?.rawText ||

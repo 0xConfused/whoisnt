@@ -10,7 +10,6 @@ interface WhoisDiffInputProps {
   onChangeDomainA: (val: string) => void;
   onChangeDomainB: (val: string) => void;
   onCompare: () => void;
-  onReset?: () => void;
   isLoading: boolean;
   error?: string | null;
 }
@@ -21,7 +20,6 @@ export const WhoisDiffInput: React.FC<WhoisDiffInputProps> = ({
   onChangeDomainA,
   onChangeDomainB,
   onCompare,
-  onReset: _onReset,
   isLoading,
   error,
 }) => {

@@ -7,10 +7,10 @@ import {
   OsintCategory,
 } from '../types';
 import { EPP_STATUS_DEFINITIONS } from '../services/whoisDiffService';
+import { WEB_RECON_FIELD_IDS } from './OsintWebSurfaceView';
 import {
   Search,
   Shield,
-  Globe,
   Calendar,
   Server,
   Layers,
@@ -37,7 +37,6 @@ const CATEGORY_CONFIG: Record<
   registrar: { label: 'REGISTRAR & SPONSOR', icon: Shield },
   security: { label: 'EPP STATUS LOCKS', icon: Shield },
   lifecycle: { label: 'LIFECYCLE & INCEPTION', icon: Calendar },
-  identity: { label: 'IDENTITY & APEX', icon: Globe },
 };
 
 const isSingleItemUnavailable = (raw: unknown): boolean => {
@@ -81,7 +80,21 @@ const isSingleItemUnavailable = (raw: unknown): boolean => {
     s === 'no records announced' ||
     s === 'no third-party verification tokens detected' ||
     s === 'no common dkim selectors detected' ||
-    s === 'unsigned / no ds or dnskey'
+    s === 'unsigned / no ds or dnskey' ||
+    s === 'no tracking ids extracted' ||
+    s === 'none detected in <head>' ||
+    s === 'no historical pdns records observed' ||
+    s === 'headers not exposed / cors restricted' ||
+    s === 'none declared in csp' ||
+    s === 'no html metadata extracted' ||
+    s === 'no dom structure parsed' ||
+    s === 'no stack signatures matched' ||
+    s === 'no external/linked scripts' ||
+    s === 'no static assets enumerated' ||
+    s === 'no external domains discovered' ||
+    s === 'no footer copyright notice detected' ||
+    s === 'unreachable over http/https' ||
+    s.startsWith('blocked by target cors policy')
   ) {
     return true;
   }
@@ -115,7 +128,6 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
   const [activeCategory, setActiveCategory] = useState<FilterCategory>('all');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [hideUnavailable, setHideUnavailable] = useState<boolean>(false);
-  const hideLowImpact = true;
   const [searchQuery, setSearchQuery] = useState<string>('');
 
   // Row collapse / expand management for large fields
@@ -150,8 +162,13 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
 
   const fieldsBeforeCategory = useMemo(() => {
     return fieldDiffs.filter((field) => {
+      // Dedicated Web Recon & Passive DNS items belong to the WEB RECON tab
+      if (field.category === 'web' || WEB_RECON_FIELD_IDS.has(field.id)) {
+        return false;
+      }
+
       // Low-impact filter
-      if (hideLowImpact && field.isLowImpact) {
+      if (field.isLowImpact) {
         return false;
       }
 
@@ -182,7 +199,7 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
 
       return true;
     });
-  }, [fieldDiffs, hideLowImpact, hideUnavailable, statusFilter, searchQuery]);
+  }, [fieldDiffs, hideUnavailable, statusFilter, searchQuery]);
 
   const filteredFields = useMemo(() => {
     if (activeCategory === 'all') return fieldsBeforeCategory;

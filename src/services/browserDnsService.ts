@@ -2,7 +2,7 @@
 
 import { VerificationTokenItem, WhoisDomainRecord } from '../types';
 
-export interface DohAnswer {
+interface DohAnswer {
   name: string;
   type: number;
   TTL: number;
@@ -69,7 +69,7 @@ export async function queryBrowserDoh(name: string, type: string, timeoutMs = 35
  * Converts RFC 1035 SOA RNAME (e.g., "dns-admin.cloudflare.com." or "first\.last.example.com.")
  * into standard email notation ("dns-admin@cloudflare.com").
  */
-export function parseSoaRname(rawRname: string): string {
+function parseSoaRname(rawRname: string): string {
   const trimmed = rawRname.replace(/\.$/, '').trim();
   if (!trimmed) return '';
 
@@ -91,7 +91,7 @@ export function parseSoaRname(rawRname: string): string {
 /**
  * Parses RFC 1035 SOA record string returned by DoH JSON.
  */
-export function parseSoaRecord(data: string): {
+function parseSoaRecord(data: string): {
   raw: string;
   mname?: string;
   rname?: string;
@@ -111,7 +111,7 @@ export function parseSoaRecord(data: string): {
 /**
  * Converts an IPv4 address to its RFC 1035 in-addr.arpa reverse lookup name.
  */
-export function ipv4ToArpa(ip: string): string | null {
+function ipv4ToArpa(ip: string): string | null {
   const parts = ip.trim().split('.');
   if (parts.length !== 4) return null;
   if (parts.some((p) => !/^\d+$/.test(p) || Number(p) < 0 || Number(p) > 255)) {
@@ -123,7 +123,7 @@ export function ipv4ToArpa(ip: string): string | null {
 /**
  * Converts an IPv6 address to its RFC 3596 ip6.arpa reverse lookup name.
  */
-export function ipv6ToArpa(ip: string): string | null {
+function ipv6ToArpa(ip: string): string | null {
   const clean = ip.trim().split('%')[0].toLowerCase();
   if (!clean.includes(':')) return null;
 
@@ -152,7 +152,7 @@ export function ipv6ToArpa(ip: string): string | null {
 /**
  * Parses RFC 8659 CAA record from textual DoH format or RFC 3597 hex wire format (\# len hex).
  */
-export function parseCaaData(raw: string): { formatted: string; iodef?: string } {
+function parseCaaData(raw: string): { formatted: string; iodef?: string } {
   const trimmed = raw.trim();
 
   // RFC 3597 hex wire format: "\# <byteLength> <hexBytes>"
@@ -211,7 +211,7 @@ function cleanTxtValue(raw: string): string {
 /**
  * Parses TXT records for verification tokens and RFC 7208 SPF mechanisms (includes + IP leaks).
  */
-export function parseTxtAttribution(txtValues: string[]): {
+function parseTxtAttribution(txtValues: string[]): {
   verificationTokens: VerificationTokenItem[];
   spfRecord?: string;
   spfIncludes: string[];

@@ -27,7 +27,7 @@ function getArrayElementSortKey(item: unknown): string {
   return semanticParts.join('|');
 }
 
-export function canonicalizeJson(value: unknown, parentKey?: string): unknown {
+function canonicalizeJson(value: unknown, parentKey?: string): unknown {
   if (value === null || value === undefined || typeof value !== 'object') {
     return value;
   }

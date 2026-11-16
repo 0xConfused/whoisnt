@@ -13,6 +13,15 @@ import { extractApexDomain } from '../utils/urlUtils';
 import { enrichDomainWithBrowserDns, queryBrowserDoh } from './browserDnsService';
 import { canonicalizeJsonStringify, formatCanonicalJsonText } from '../utils/jsonSort';
 import { parseFlexibleDateMs } from '../utils/dateUtils';
+import {
+  analyzeHtmlRecon,
+  extractAnalyticsIdsFromText,
+  MAX_HTML_RECON_BYTES,
+  MAX_SCRIPT_TEXT_BYTES,
+  readBoundedResponseText,
+  sanitizeHttpHeaders,
+  selectFirstPartyScriptsForInspection,
+} from '../utils/htmlRecon';
 
 export function sanitizeDomainInput(raw: string): string {
   if (!raw) return '';
@@ -34,7 +43,7 @@ export function isValidDomainFormat(domain: string): boolean {
   return domainRegex.test(domain);
 }
 
-export function inferDnsProvider(nameservers: string[]): string {
+function inferDnsProvider(nameservers: string[]): string {
   if (!nameservers || nameservers.length === 0) return 'Undetermined';
   const nsString = nameservers.join(' ').toLowerCase();
 
@@ -61,11 +70,11 @@ export function inferDnsProvider(nameservers: string[]): string {
   return apex ? `${apex.toUpperCase()} DNS` : 'Custom Infrastructure';
 }
 
-export function parseDateToTimestamp(dateStr?: string): number | null {
+function parseDateToTimestamp(dateStr?: string): number | null {
   return parseFlexibleDateMs(dateStr);
 }
 
-export function formatDomainAge(createdDateStr?: string): { years: number; formatted: string } | null {
+function formatDomainAge(createdDateStr?: string): { years: number; formatted: string } | null {
   const ts = parseDateToTimestamp(createdDateStr);
   if (!ts) return null;
 
@@ -87,7 +96,7 @@ export function formatDomainAge(createdDateStr?: string): { years: number; forma
   return { years, formatted: formatted.trim() };
 }
 
-export function formatExpirationCountdown(expiresDateStr?: string): { days: number; status: 'active' | 'expiring-soon' | 'expired' } | null {
+function formatExpirationCountdown(expiresDateStr?: string): { days: number; status: 'active' | 'expiring-soon' | 'expired' } | null {
   const ts = parseDateToTimestamp(expiresDateStr);
   if (!ts) return null;
 
@@ -136,7 +145,7 @@ function normalizeArray(arr?: string[] | null): string[] {
   return Array.from(new Set(arr.map((s) => String(s).trim().toLowerCase()).filter(Boolean))).sort();
 }
 
-export function compareValues(
+function compareValues(
   valA: string | string[] | null | undefined,
   valB: string | string[] | null | undefined
 ): DiffStatus {
@@ -210,7 +219,7 @@ function extractDkimTenantBase(target: string): string {
   return extractApexDomain(lower) || lower;
 }
 
-export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomainRecord): WhoisDiffResult {
+function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomainRecord): WhoisDiffResult {
   const fieldDiffs: FieldDiffItem[] = [];
 
   // ==========================================
@@ -226,9 +235,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.registrantOrg || 'Redacted for Privacy / Proxy',
     valueB: domainB.registrantOrg || 'Redacted for Privacy / Proxy',
     status: compareValues(domainA.registrantOrg, domainB.registrantOrg),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: true,
   });
 
   // Verification Tokens (Google, Microsoft, Atlassian, Apple, Stripe, etc.)
@@ -245,9 +251,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: tokensA.length > 0 ? tokensA : ['No third-party verification tokens detected'],
     valueB: tokensB.length > 0 ? tokensB : ['No third-party verification tokens detected'],
     status: compareValues(tokensA, tokensB),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: true,
     deltaSummary:
       sharedTokens.length > 0
         ? `ATTRIBUTION MATCH: ${sharedTokens.length} identical verification token(s) shared!`
@@ -269,9 +272,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: spfIncludesA.length > 0 ? spfIncludesA : [domainA.spfRecord || 'No SPF record'],
     valueB: spfIncludesB.length > 0 ? spfIncludesB : [domainB.spfRecord || 'No SPF record'],
     status: compareValues(spfIncludesA, spfIncludesB),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: true,
     deltaSummary:
       sharedSpf.length > 0
         ? `SHARED MAIL GATEWAYS: ${sharedSpf.join(', ')}`
@@ -294,9 +294,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: spfIpsA.length > 0 ? spfIpsA : ['None specified'],
       valueB: spfIpsB.length > 0 ? spfIpsB : ['None specified'],
       status: compareValues(spfIpsA, spfIpsB),
-      impactLevel: 'high',
-      isLowImpact: false,
-      isAttributionPivot: true,
       deltaSummary:
         sharedSpfIps.length > 0
           ? `SHARED SPF ORIGIN LEAK: ${sharedSpfIps.join(', ')}`
@@ -344,11 +341,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
         domainA.dmarcRuf || domainA.dmarcRua || domainA.dmarcPolicy,
         domainB.dmarcRuf || domainB.dmarcRua || domainB.dmarcPolicy
       ),
-      impactLevel: domainA.dmarcRua || domainB.dmarcRua || domainA.dmarcRuf || domainB.dmarcRuf ? 'high' : 'medium',
-      isLowImpact: false,
-      isAttributionPivot: Boolean(
-        (domainA.dmarcRua && domainB.dmarcRua) || (domainA.dmarcRuf && domainB.dmarcRuf)
-      ),
       deltaSummary: dmarcRuaMatch || dmarcRufMatch ? 'SHARED DMARC REPORTING DESTINATION' : undefined,
     });
   }
@@ -373,9 +365,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: dkimA.length > 0 ? dkimA : ['No common DKIM selectors detected'],
       valueB: dkimB.length > 0 ? dkimB : ['No common DKIM selectors detected'],
       status: compareValues(dkimA, dkimB),
-      impactLevel: 'high',
-      isLowImpact: false,
-      isAttributionPivot: true,
       deltaSummary:
         sharedDkimTargets.length > 0
           ? `SHARED DKIM TENANT DELEGATION: ${sharedDkimTargets.join(', ')}`
@@ -398,14 +387,85 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: domainA.soaRname || 'Not resolved',
       valueB: domainB.soaRname || 'Not resolved',
       status: compareValues(domainA.soaRname, domainB.soaRname),
-      impactLevel: 'high',
-      isLowImpact: false,
-      isAttributionPivot: true,
       deltaSummary: sameSoaRname
         ? GENERIC_SOA_RNAMES.has(normalizeString(domainA.soaRname))
           ? 'Shared managed DNS hostmaster'
           : `CUSTOM HOSTMASTER MATCH: ${domainA.soaRname}`
         : undefined,
+    });
+  }
+
+  // Analytics & Tracking IDs (GA4, UA, GTM, AdSense, Meta Pixel, Clarity, etc.)
+  const analyticsA = domainA.analyticsIds || [];
+  const analyticsB = domainB.analyticsIds || [];
+  const setAnalyticsB = new Set(analyticsB.map((a) => a.toLowerCase()));
+  const sharedAnalyticsIds = analyticsA.filter((a) => setAnalyticsB.has(a.toLowerCase()));
+
+  if (analyticsA.length > 0 || analyticsB.length > 0) {
+    fieldDiffs.push({
+      id: 'analytics_ids',
+      category: 'attribution',
+      label: 'Analytics & Ad Tracking IDs',
+      rfcOrSpec: 'HTML / First-Party JS Static Scan',
+      valueA: analyticsA.length > 0 ? analyticsA : ['No tracking IDs extracted'],
+      valueB: analyticsB.length > 0 ? analyticsB : ['No tracking IDs extracted'],
+      status: compareValues(analyticsA, analyticsB),
+      deltaSummary:
+        sharedAnalyticsIds.length > 0
+          ? `ATTRIBUTION MATCH: Shared tracking ID(s) (${sharedAnalyticsIds.join(', ')})`
+          : 'Distinct analytics properties',
+    });
+  }
+
+  // HTML Meta Verification Tokens
+  const htmlTokA = (domainA.htmlVerificationTokens || []).map((t) => `${t.provider}: ${t.token}`);
+  const htmlTokB = (domainB.htmlVerificationTokens || []).map((t) => `${t.provider}: ${t.token}`);
+  const setHtmlTokB = new Set((domainB.htmlVerificationTokens || []).map((t) => t.token));
+  const sharedHtmlTokens = (domainA.htmlVerificationTokens || []).filter((t) => setHtmlTokB.has(t.token));
+
+  if (htmlTokA.length > 0 || htmlTokB.length > 0) {
+    fieldDiffs.push({
+      id: 'html_verification_tokens',
+      category: 'attribution',
+      label: 'HTML Meta Verification Tokens',
+      rfcOrSpec: 'HTML <meta> Ownership Tags',
+      valueA: htmlTokA.length > 0 ? htmlTokA : ['None detected in <head>'],
+      valueB: htmlTokB.length > 0 ? htmlTokB : ['None detected in <head>'],
+      status: compareValues(htmlTokA, htmlTokB),
+      deltaSummary:
+        sharedHtmlTokens.length > 0
+          ? `ATTRIBUTION MATCH: ${sharedHtmlTokens.length} identical HTML verification meta tag(s)`
+          : 'Separate webmaster verification meta tags',
+    });
+  }
+
+  // Footer Copyright Notices & Extracted Holder Entities
+  const copyrightNoticesA = domainA.footerCopyrights || [];
+  const copyrightNoticesB = domainB.footerCopyrights || [];
+  const copyrightEntitiesA = domainA.copyrightEntities || [];
+  const copyrightEntitiesB = domainB.copyrightEntities || [];
+  const normCopyrightB = new Set(copyrightEntitiesB.map((e) => normalizeString(e)).filter(Boolean));
+  const sharedCopyrightEntities = Array.from(
+    new Set(copyrightEntitiesA.filter((e) => normCopyrightB.has(normalizeString(e))))
+  ).sort();
+
+  if (copyrightNoticesA.length > 0 || copyrightNoticesB.length > 0) {
+    const compareTargetA = copyrightEntitiesA.length > 0 ? copyrightEntitiesA : copyrightNoticesA;
+    const compareTargetB = copyrightEntitiesB.length > 0 ? copyrightEntitiesB : copyrightNoticesB;
+    fieldDiffs.push({
+      id: 'footer_copyright',
+      category: 'attribution',
+      label: 'Footer Copyright Notice & Holder',
+      rfcOrSpec: 'HTML <footer> Copyright Extraction',
+      valueA: copyrightNoticesA.length > 0 ? copyrightNoticesA : ['No footer copyright notice detected'],
+      valueB: copyrightNoticesB.length > 0 ? copyrightNoticesB : ['No footer copyright notice detected'],
+      status: compareValues(compareTargetA, compareTargetB),
+      deltaSummary:
+        sharedCopyrightEntities.length > 0
+          ? `ATTRIBUTION MATCH: Shared copyright holder (${sharedCopyrightEntities.join(', ')})`
+          : copyrightNoticesA.length > 0 && copyrightNoticesB.length > 0
+          ? `Distinct copyright holders (${copyrightEntitiesA[0] || 'A'} vs ${copyrightEntitiesB[0] || 'B'})`
+          : 'Footer copyright notice present on single target only',
     });
   }
 
@@ -418,8 +478,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.registrantCountry ? `${domainA.registrantCountry.toUpperCase()}${domainA.registrantState ? ` (${domainA.registrantState})` : ''}` : 'Redacted / Not Disclosed',
     valueB: domainB.registrantCountry ? `${domainB.registrantCountry.toUpperCase()}${domainB.registrantState ? ` (${domainB.registrantState})` : ''}` : 'Redacted / Not Disclosed',
     status: compareValues(domainA.registrantCountry, domainB.registrantCountry),
-    impactLevel: 'medium',
-    isLowImpact: false,
   });
 
   // ==========================================
@@ -435,9 +493,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.tlsSubjectOrg ? `${domainA.tlsSubjectOrg} (${domainA.tlsSubjectCn || domainA.domainName})` : domainA.tlsSubjectCn || 'Domain Validation (DV Only)',
     valueB: domainB.tlsSubjectOrg ? `${domainB.tlsSubjectOrg} (${domainB.tlsSubjectCn || domainB.domainName})` : domainB.tlsSubjectCn || 'Domain Validation (DV Only)',
     status: compareValues(domainA.tlsSubjectOrg || domainA.tlsSubjectCn, domainB.tlsSubjectOrg || domainB.tlsSubjectCn),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: Boolean(domainA.tlsSubjectOrg && domainB.tlsSubjectOrg),
   });
 
   // Live TLS Issuer CA
@@ -445,12 +500,10 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     id: 'tls_issuer_ca',
     category: 'certificates',
     label: 'SSL/TLS Certificate Authority',
-    rfcOrSpec: 'RFC 5280 CA Hierarchy',
+    rfcOrSpec: 'RFC 5280 CA / CT Log Hierarchy',
     valueA: domainA.tlsIssuerOrg ? `${domainA.tlsIssuerOrg}${domainA.tlsIssuerCn ? ` [${domainA.tlsIssuerCn}]` : ''}` : 'Probe Unresolved',
     valueB: domainB.tlsIssuerOrg ? `${domainB.tlsIssuerOrg}${domainB.tlsIssuerCn ? ` [${domainB.tlsIssuerCn}]` : ''}` : 'Probe Unresolved',
     status: compareValues(domainA.tlsIssuerOrg, domainB.tlsIssuerOrg),
-    impactLevel: 'medium',
-    isLowImpact: false,
   });
 
   // TLS Handshake Protocol & Cipher
@@ -463,12 +516,29 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: domainA.tlsProtocol ? `${domainA.tlsProtocol} (${domainA.tlsCipher || 'Default Cipher'})` : 'Connection Failed',
       valueB: domainB.tlsProtocol ? `${domainB.tlsProtocol} (${domainB.tlsCipher || 'Default Cipher'})` : 'Connection Failed',
       status: compareValues(domainA.tlsProtocol, domainB.tlsProtocol),
-      impactLevel: 'medium',
-      isLowImpact: false,
     });
   }
 
-  // Certificate Transparency (crt.name / crt.sh) Subdomains
+  // TLS Validity Window
+  if (domainA.tlsValidityNotAfter || domainB.tlsValidityNotAfter) {
+    const valA = domainA.tlsValidityNotAfter
+      ? `${domainA.tlsValidityNotBefore || '?'} -> ${domainA.tlsValidityNotAfter}`
+      : 'Not inspected';
+    const valB = domainB.tlsValidityNotAfter
+      ? `${domainB.tlsValidityNotBefore || '?'} -> ${domainB.tlsValidityNotAfter}`
+      : 'Not inspected';
+    fieldDiffs.push({
+      id: 'tls_validity',
+      category: 'certificates',
+      label: 'X.509 Certificate Validity Window',
+      rfcOrSpec: 'RFC 5280 NotBefore / NotAfter',
+      valueA: valA,
+      valueB: valB,
+      status: compareValues(valA, valB),
+    });
+  }
+
+  // Certificate Transparency (crt.name / Certspotter) Subdomains
   const sampleA = domainA.crtSubdomainsSample || [];
   const sampleB = domainB.crtSubdomainsSample || [];
   const setSubsB = new Set(sampleB.map((s) => s.split('.')[0].toLowerCase()));
@@ -481,15 +551,13 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     id: 'crt_subdomains_count',
     category: 'certificates',
     label: 'Certificate Transparency Subdomains',
-    rfcOrSpec: 'RFC 6962 CT Logs / crt.name',
+    rfcOrSpec: 'RFC 6962 CT Logs',
     valueA: `${domainA.crtSubdomainsCount?.toLocaleString() || 0} subdomains discovered${domainA.crtWildcardFound ? ' [Wildcard *. cert]' : ''}`,
     valueB: `${domainB.crtSubdomainsCount?.toLocaleString() || 0} subdomains discovered${domainB.crtWildcardFound ? ' [Wildcard *. cert]' : ''}`,
     status:
       domainA.crtSubdomainsCount === domainB.crtSubdomainsCount
         ? 'MATCH'
         : 'DIFF',
-    impactLevel: 'high',
-    isLowImpact: false,
     deltaSummary:
       uniqueSharedSubs.length > 0
         ? `COMMON SUBDOMAIN NAMING: ${uniqueSharedSubs.join(', ')}`
@@ -513,9 +581,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: asnStrA,
     valueB: asnStrB,
     status: compareValues(domainA.asn, domainB.asn),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: sameAsn,
     deltaSummary: sameAsn ? 'SHARED HOSTING NETWORK (Same Autonomous System)' : 'Separate upstream network providers',
   });
 
@@ -529,9 +594,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.subnet24 || 'None resolved',
     valueB: domainB.subnet24 || 'None resolved',
     status: compareValues(domainA.subnet24, domainB.subnet24),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: sameSubnet,
     deltaSummary: sameSubnet ? 'COLLISION: Co-located inside the same /24 IP subnet!' : undefined,
   });
 
@@ -544,8 +606,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.aRecords?.length ? domainA.aRecords : ['None resolved'],
     valueB: domainB.aRecords?.length ? domainB.aRecords : ['None resolved'],
     status: compareValues(domainA.aRecords, domainB.aRecords),
-    impactLevel: 'medium',
-    isLowImpact: false,
   });
 
   // Reverse DNS (PTR)
@@ -564,13 +624,34 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: ptrA.length > 0 ? ptrA : ['No PTR record'],
       valueB: ptrB.length > 0 ? ptrB : ['No PTR record'],
       status: compareValues(ptrHostsA, ptrHostsB),
-      impactLevel: 'high',
-      isLowImpact: false,
-      isAttributionPivot: sharedPtrHostnames.length > 0,
       deltaSummary:
         sharedPtrHostnames.length > 0
           ? `IDENTICAL PTR HOSTNAME: ${sharedPtrHostnames.join(', ')}`
           : undefined,
+    });
+  }
+
+  // Passive DNS Historical Resolutions & IPs
+  const pdnsDispA = domainA.passiveDnsDisplay || [];
+  const pdnsDispB = domainB.passiveDnsDisplay || [];
+  const pdnsIpsA = domainA.passiveDnsIps || [];
+  const pdnsIpsB = domainB.passiveDnsIps || [];
+  const setPdnsIpB = new Set(pdnsIpsB);
+  const sharedPassiveDnsIps = pdnsIpsA.filter((ip) => setPdnsIpB.has(ip));
+
+  if (pdnsDispA.length > 0 || pdnsDispB.length > 0) {
+    fieldDiffs.push({
+      id: 'passive_dns_records',
+      category: 'network',
+      label: 'Passive DNS Historical Resolutions',
+      rfcOrSpec: 'PDNS / Historical IP Footprint',
+      valueA: pdnsDispA.length > 0 ? pdnsDispA : ['No historical PDNS records observed'],
+      valueB: pdnsDispB.length > 0 ? pdnsDispB : ['No historical PDNS records observed'],
+      status: compareValues(pdnsIpsA.length > 0 ? pdnsIpsA : pdnsDispA, pdnsIpsB.length > 0 ? pdnsIpsB : pdnsDispB),
+      deltaSummary:
+        sharedPassiveDnsIps.length > 0
+          ? `HISTORICAL IP OVERLAP: ${sharedPassiveDnsIps.slice(0, 4).join(', ')}`
+          : 'Distinct historical DNS resolution footprints',
     });
   }
 
@@ -584,8 +665,166 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: domainA.httpWebServer ? `${domainA.httpWebServer} (HTTP ${domainA.httpStatusCode || 200})` : 'Undisclosed / Hidden',
       valueB: domainB.httpWebServer ? `${domainB.httpWebServer} (HTTP ${domainB.httpStatusCode || 200})` : 'Undisclosed / Hidden',
       status: compareValues(domainA.httpWebServer, domainB.httpWebServer),
-      impactLevel: 'medium',
-      isLowImpact: false,
+    });
+  }
+
+  // ==========================================
+  // 3B. WEB STACK, HEADERS, DOM & RESOURCES (STATIC / ZERO-EXECUTION)
+  // ==========================================
+
+  const formatWebStatus = (d: WhoisDomainRecord) => {
+    if (d.webReconMode === 'cors-blocked') return 'Blocked by Target CORS Policy (Use backend server for direct inspection)';
+    if (d.webReconMode === 'unreachable') return 'Unreachable over HTTP/HTTPS';
+    if (!d.httpStatusCode && !d.webFinalUrl) return 'Not available';
+    const scriptsNote = d.inspectedScriptsCount ? ` · ${d.inspectedScriptsCount} first-party JS scanned (static text only)` : '';
+    return `HTTP ${d.httpStatusCode || '?'} · ${d.webFinalUrl || `https://${d.domainName}`} [${d.webReconMode || 'direct'}]${scriptsNote}`;
+  };
+
+  if (domainA.webReconMode || domainB.webReconMode) {
+    fieldDiffs.push({
+      id: 'web_recon_status',
+      category: 'web',
+      label: 'HTTP Probe & Resource Access Mode',
+      rfcOrSpec: 'RFC 9110 / Zero-Exec Static Fetch',
+      valueA: formatWebStatus(domainA),
+      valueB: formatWebStatus(domainB),
+      status: compareValues(domainA.webFinalUrl || domainA.webReconMode, domainB.webFinalUrl || domainB.webReconMode),
+    });
+  }
+
+  const hdrsA = domainA.httpHeaderSummary || [];
+  const hdrsB = domainB.httpHeaderSummary || [];
+  if (hdrsA.length > 0 || hdrsB.length > 0) {
+    fieldDiffs.push({
+      id: 'http_headers',
+      category: 'web',
+      label: 'Sanitized HTTP Response Headers',
+      rfcOrSpec: 'RFC 9110 / Security Headers',
+      valueA: hdrsA.length > 0 ? hdrsA : ['Headers not exposed / CORS restricted'],
+      valueB: hdrsB.length > 0 ? hdrsB : ['Headers not exposed / CORS restricted'],
+      status: compareValues(hdrsA, hdrsB),
+    });
+  }
+
+  const cspExtA = domainA.cspExternalDomains || [];
+  const cspExtB = domainB.cspExternalDomains || [];
+  if (cspExtA.length > 0 || cspExtB.length > 0) {
+    fieldDiffs.push({
+      id: 'csp_external_domains',
+      category: 'web',
+      label: 'CSP External Origin Whitelist',
+      rfcOrSpec: 'W3C Content-Security-Policy',
+      valueA: cspExtA.length > 0 ? cspExtA : ['None declared in CSP'],
+      valueB: cspExtB.length > 0 ? cspExtB : ['None declared in CSP'],
+      status: compareValues(cspExtA, cspExtB),
+    });
+  }
+
+  const formatHtmlMeta = (d: WhoisDomainRecord): string[] => {
+    const items: string[] = [];
+    if (d.htmlTitle) items.push(`Title: ${d.htmlTitle}`);
+    if (d.openGraphSiteName) items.push(`OG Site Name: ${d.openGraphSiteName}`);
+    if (d.htmlGenerator) items.push(`Generator: ${d.htmlGenerator}`);
+    if (d.htmlAuthor) items.push(`Author: ${d.htmlAuthor}`);
+    if (d.twitterSite) items.push(`Twitter Site: ${d.twitterSite}`);
+    if (d.canonicalUrl) items.push(`Canonical: ${d.canonicalUrl}`);
+    if (d.htmlRobots) items.push(`Robots: ${d.htmlRobots}`);
+    if (d.htmlDescription) items.push(`Description: ${d.htmlDescription}`);
+    return items;
+  };
+  const metaA = formatHtmlMeta(domainA);
+  const metaB = formatHtmlMeta(domainB);
+  if (metaA.length > 0 || metaB.length > 0) {
+    fieldDiffs.push({
+      id: 'html_metadata',
+      category: 'web',
+      label: 'HTML Metadata & Canonical Identity',
+      rfcOrSpec: 'HTML5 <meta> / OpenGraph',
+      valueA: metaA.length > 0 ? metaA : ['No HTML metadata extracted'],
+      valueB: metaB.length > 0 ? metaB : ['No HTML metadata extracted'],
+      status: compareValues(metaA, metaB),
+    });
+  }
+
+  const domItemsA = [...(domainA.domMarkers || []), ...(domainA.domStats ? [`Stats: ${domainA.domStats}`] : [])];
+  const domItemsB = [...(domainB.domMarkers || []), ...(domainB.domStats ? [`Stats: ${domainB.domStats}`] : [])];
+  if (domItemsA.length > 0 || domItemsB.length > 0) {
+    fieldDiffs.push({
+      id: 'dom_inspection',
+      category: 'web',
+      label: 'DOM Structure & Framework Mounts',
+      rfcOrSpec: 'Inert DOMParser Inspection',
+      valueA: domItemsA.length > 0 ? domItemsA : ['No DOM structure parsed'],
+      valueB: domItemsB.length > 0 ? domItemsB : ['No DOM structure parsed'],
+      status: compareValues(domainA.domMarkers || [], domainB.domMarkers || []),
+    });
+  }
+
+  const techA = domainA.technologies || [];
+  const techB = domainB.technologies || [];
+  const setTechB = new Set(techB.map((t) => t.toLowerCase()));
+  const sharedTechnologies = techA.filter((t) => setTechB.has(t.toLowerCase()));
+  if (techA.length > 0 || techB.length > 0) {
+    fieldDiffs.push({
+      id: 'technologies',
+      category: 'web',
+      label: 'Web Technology Fingerprints',
+      rfcOrSpec: 'Headers / DOM / Asset Signatures',
+      valueA: techA.length > 0 ? techA : ['No stack signatures matched'],
+      valueB: techB.length > 0 ? techB : ['No stack signatures matched'],
+      status: compareValues(techA, techB),
+      deltaSummary:
+        sharedTechnologies.length > 0
+          ? `Shared stack components: ${sharedTechnologies.join(', ')}`
+          : 'Divergent application stack',
+    });
+  }
+
+  const scriptsA = domainA.scriptUrls || [];
+  const scriptsB = domainB.scriptUrls || [];
+  if (scriptsA.length > 0 || scriptsB.length > 0) {
+    fieldDiffs.push({
+      id: 'script_urls',
+      category: 'web',
+      label: 'Collected Script URLs (<script src>)',
+      rfcOrSpec: 'Static HTML Tag Enumeration',
+      valueA: scriptsA.length > 0 ? scriptsA : ['No external/linked scripts'],
+      valueB: scriptsB.length > 0 ? scriptsB : ['No external/linked scripts'],
+      status: compareValues(scriptsA, scriptsB),
+    });
+  }
+
+  const resA = domainA.resourceSummary || [];
+  const resB = domainB.resourceSummary || [];
+  if (resA.length > 0 || resB.length > 0) {
+    fieldDiffs.push({
+      id: 'resource_enumeration',
+      category: 'web',
+      label: 'Enumerated Resources (CSS / Icons / Media)',
+      rfcOrSpec: 'Static HTML & CSS Asset URLs',
+      valueA: resA.length > 0 ? resA : ['No static assets enumerated'],
+      valueB: resB.length > 0 ? resB : ['No static assets enumerated'],
+      status: compareValues(resA, resB),
+    });
+  }
+
+  const extDomA = domainA.externalDomains || [];
+  const extDomB = domainB.externalDomains || [];
+  const setExtDomB = new Set(extDomB.map((d) => d.toLowerCase()));
+  const sharedExternalDomains = extDomA.filter((d) => setExtDomB.has(d.toLowerCase()));
+  if (extDomA.length > 0 || extDomB.length > 0) {
+    fieldDiffs.push({
+      id: 'external_domains',
+      category: 'web',
+      label: 'Discovered External Third-Party Domains',
+      rfcOrSpec: 'Outbound Links, Assets & CSP',
+      valueA: extDomA.length > 0 ? extDomA : ['No external domains discovered'],
+      valueB: extDomB.length > 0 ? extDomB : ['No external domains discovered'],
+      status: compareValues(extDomA, extDomB),
+      deltaSummary:
+        sharedExternalDomains.length > 0
+          ? `SHARED EXTERNAL ORIGINS: ${sharedExternalDomains.slice(0, 5).join(', ')}`
+          : 'Distinct external domain dependencies',
     });
   }
 
@@ -604,8 +843,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: dnsProvA,
     valueB: dnsProvB,
     status: compareValues(dnsProvA, dnsProvB),
-    impactLevel: 'high',
-    isLowImpact: false,
   });
 
   // Authoritative Nameservers
@@ -617,17 +854,9 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.nameservers.length > 0 ? domainA.nameservers : ['None listed'],
     valueB: domainB.nameservers.length > 0 ? domainB.nameservers : ['None listed'],
     status: compareValues(domainA.nameservers, domainB.nameservers),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: true,
   });
 
   // SOA Primary Master (MNAME)
-  const sameSoaMname = Boolean(
-    domainA.soaMname &&
-      domainB.soaMname &&
-      normalizeString(domainA.soaMname) === normalizeString(domainB.soaMname)
-  );
   if (domainA.soaMname || domainB.soaMname) {
     fieldDiffs.push({
       id: 'soa_mname',
@@ -637,9 +866,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: domainA.soaMname ? `${domainA.soaMname}${domainA.soaSerial ? ` (serial ${domainA.soaSerial})` : ''}` : 'Not resolved',
       valueB: domainB.soaMname ? `${domainB.soaMname}${domainB.soaSerial ? ` (serial ${domainB.soaSerial})` : ''}` : 'Not resolved',
       status: compareValues(domainA.soaMname, domainB.soaMname),
-      impactLevel: 'medium',
-      isLowImpact: false,
-      isAttributionPivot: sameSoaMname,
     });
   }
 
@@ -654,9 +880,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: mailProvA,
     valueB: mailProvB,
     status: compareValues(mailProvA, mailProvB),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: mailProvA !== 'No MX Records' && mailProvA !== 'No MX Records Listed' && mailProvA === mailProvB,
   });
 
   // DNSSEC
@@ -668,8 +891,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.dnssec.toUpperCase(),
     valueB: domainB.dnssec.toUpperCase(),
     status: compareValues(domainA.dnssec, domainB.dnssec),
-    impactLevel: 'medium',
-    isLowImpact: false,
   });
 
   // DNSSEC Key Tags & DS Digests
@@ -689,8 +910,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: keysA.length > 0 ? keysA : ['Unsigned / No DS or DNSKEY'],
       valueB: keysB.length > 0 ? keysB : ['Unsigned / No DS or DNSKEY'],
       status: compareValues(keysA, keysB),
-      impactLevel: 'medium',
-      isLowImpact: false,
     });
   }
 
@@ -712,9 +931,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       valueA: caaA.length > 0 ? caaA : ['No CAA restriction'],
       valueB: caaB.length > 0 ? caaB : ['No CAA restriction'],
       status: compareValues(caaA, caaB),
-      impactLevel: sharedCaaIodef.length > 0 ? 'high' : 'medium',
-      isLowImpact: false,
-      isAttributionPivot: sharedCaaIodef.length > 0,
       deltaSummary:
         sharedCaaIodef.length > 0
           ? `SHARED CAA IODEF CONTACT: ${sharedCaaIodef.join(', ')}`
@@ -735,9 +951,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.registrar || 'Protected / Redacted',
     valueB: domainB.registrar || 'Protected / Redacted',
     status: compareValues(domainA.registrar, domainB.registrar),
-    impactLevel: 'high',
-    isLowImpact: false,
-    isAttributionPivot: Boolean(domainA.registrar && domainB.registrar && domainA.registrar === domainB.registrar),
   });
 
   // EPP Domain Status Flags
@@ -749,8 +962,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.status.length > 0 ? domainA.status : ['ok (unlocked)'],
     valueB: domainB.status.length > 0 ? domainB.status : ['ok (unlocked)'],
     status: compareValues(domainA.status, domainB.status),
-    impactLevel: 'high',
-    isLowImpact: false,
   });
 
   // Abuse Contact Email
@@ -762,8 +973,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: domainA.abuseContactEmail || 'Protected / Registry Proxy',
     valueB: domainB.abuseContactEmail || 'Protected / Registry Proxy',
     status: compareValues(domainA.abuseContactEmail, domainB.abuseContactEmail),
-    impactLevel: 'medium',
-    isLowImpact: false,
   });
 
   // ==========================================
@@ -790,7 +999,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
           ? 'MATCH'
           : 'DIFF'
         : 'DIFF',
-    impactLevel: isSignificantAgeDiscrepancy ? 'high' : 'low',
     isLowImpact: !isSignificantAgeDiscrepancy,
     deltaSummary:
       ageDeltaYears !== undefined
@@ -827,9 +1035,7 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: formatUtcPrecision(domainA.createdDate),
     valueB: formatUtcPrecision(domainB.createdDate),
     status: compareValues(domainA.createdDate, domainB.createdDate),
-    impactLevel: isCreationClustered || isSignificantAgeDiscrepancy ? 'high' : 'low',
     isLowImpact: !isCreationClustered && !isSignificantAgeDiscrepancy,
-    isAttributionPivot: isCreationClustered,
     deltaSummary:
       createdDeltaSeconds !== undefined
         ? isCreationClustered
@@ -853,9 +1059,7 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
         `Updated: ${formatUtcPrecision(domainB.updatedDate)}`,
       ],
       status: isCreationClustered || isUpdateClustered ? 'MATCH' : 'DIFF',
-      impactLevel: isCreationClustered || isUpdateClustered ? 'high' : 'low',
       isLowImpact: !isCreationClustered && !isUpdateClustered,
-      isAttributionPivot: isCreationClustered || isUpdateClustered,
       deltaSummary: [
         createdDeltaSeconds !== undefined
           ? `Creation gap: ${formatExactDuration(createdDeltaSeconds)}${isCreationClustered ? ' [CLUSTERED <= 24H]' : ''}`
@@ -892,7 +1096,6 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
         ? `${domainB.daysUntilExpiration.toLocaleString()} days (${domainB.expirationStatus?.toUpperCase()})`
         : 'Undetermined',
     status: compareValues(domainA.expirationStatus, domainB.expirationStatus),
-    impactLevel: isSignificantExpDiscrepancy ? 'high' : 'low',
     isLowImpact: !isSignificantExpDiscrepancy,
     deltaSummary:
       expDaysDelta !== undefined
@@ -902,7 +1105,7 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
         : undefined,
   });
 
-  // LOW IMPACT: Last Registry Update Timestamp (Hidden by default unless clustered)
+  // Last Registry Update Timestamp (Hidden unless clustered)
   fieldDiffs.push({
     id: 'updated_date',
     category: 'lifecycle',
@@ -911,24 +1114,10 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     valueA: formatUtcPrecision(domainA.updatedDate),
     valueB: formatUtcPrecision(domainB.updatedDate),
     status: compareValues(domainA.updatedDate, domainB.updatedDate),
-    impactLevel: isUpdateClustered ? 'medium' : 'low',
     isLowImpact: !isUpdateClustered,
     deltaSummary: isUpdateClustered
       ? `Registry updates within ${formatExactDuration(updatedDeltaSeconds!)}`
       : 'Routine registry sync timestamp (low analytical value)',
-  });
-
-  // LOW IMPACT: Registrar IANA ID Number
-  fieldDiffs.push({
-    id: 'iana_id',
-    category: 'registrar',
-    label: 'Registrar IANA ID Number',
-    rfcOrSpec: 'IANA Registry',
-    valueA: domainA.ianaId ? `ID #${domainA.ianaId}` : 'Not Specified',
-    valueB: domainB.ianaId ? `ID #${domainB.ianaId}` : 'Not Specified',
-    status: compareValues(domainA.ianaId, domainB.ianaId),
-    impactLevel: 'low',
-    isLowImpact: true,
   });
 
   // ==========================================
@@ -942,6 +1131,51 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       title: 'Shared Verification Fingerprints',
       description: `Domains share ${sharedTokens.length} identical verification token(s) (${sharedTokens.map((t) => t.provider).join(', ')}). High certainty of identical administrative account.`,
       strength: 'definitive',
+    });
+  }
+
+  if (sharedAnalyticsIds.length > 0) {
+    linkages.push({
+      type: 'attribution',
+      title: 'Shared Analytics / Advertising Tracking ID',
+      description: `Both targets embed identical analytics or publisher identifier(s): ${sharedAnalyticsIds.join(', ')}. Strong evidence of shared web property ownership.`,
+      strength: 'definitive',
+    });
+  }
+
+  if (sharedHtmlTokens.length > 0) {
+    linkages.push({
+      type: 'attribution',
+      title: 'Shared HTML Meta Verification Token',
+      description: `HTML <head> contains ${sharedHtmlTokens.length} identical verification tag(s) (${sharedHtmlTokens.map((t) => t.provider).join(', ')}).`,
+      strength: 'definitive',
+    });
+  }
+
+  if (sharedCopyrightEntities.length > 0) {
+    linkages.push({
+      type: 'attribution',
+      title: 'Matching Footer Copyright Entity',
+      description: `Both domains declare the identical legal copyright holder in their page footer: "${sharedCopyrightEntities.join('", "')}".`,
+      strength: 'definitive',
+    });
+  }
+
+  if (sharedPassiveDnsIps.length > 0) {
+    linkages.push({
+      type: 'network',
+      title: 'Historical Passive DNS IP Overlap',
+      description: `Passive DNS history shows both domains historically resolved to identical IP address(es): ${sharedPassiveDnsIps.slice(0, 4).join(', ')}.`,
+      strength: 'strong',
+    });
+  }
+
+  if (sharedExternalDomains.length > 0) {
+    linkages.push({
+      type: 'infrastructure',
+      title: 'Shared External Resource Origins',
+      description: `Both domains reference ${sharedExternalDomains.length} shared external third-party host(s) (${sharedExternalDomains.slice(0, 4).join(', ')}).`,
+      strength: 'moderate',
     });
   }
 
@@ -1077,15 +1311,11 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
 
   const divergentCount = fieldDiffs.filter((f) => f.status === 'DIFF' || f.status === 'ONLY_A' || f.status === 'ONLY_B').length;
   const matchingCount = fieldDiffs.filter((f) => f.status === 'MATCH').length;
-  const highImpactCount = fieldDiffs.filter((f) => f.impactLevel === 'high').length;
-  const lowImpactCount = fieldDiffs.filter((f) => f.isLowImpact).length;
 
   const summary: WhoisDiffSummary = {
     totalFieldsCompared: fieldDiffs.length,
     divergentCount,
     matchingCount,
-    highImpactCount,
-    lowImpactCount,
     ageDeltaFormatted:
       ageDeltaYears !== undefined
         ? `${ageDeltaYears.toFixed(1)}y (${domainA.domainAgeYears! > domainB.domainAgeYears! ? domainA.domainName : domainB.domainName} older)`
@@ -1094,11 +1324,8 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
       expDaysDelta !== undefined
         ? `${expDaysDelta.toLocaleString()} days gap`
         : undefined,
-    hasSignificantAgeDiscrepancy: isSignificantAgeDiscrepancy,
-    hasSignificantExpirationDiscrepancy: isSignificantExpDiscrepancy,
     sharedNameserversCount: sharedNs.length,
     totalNameserversCount: unionNs.size,
-    sharedEppCount: (domainA.status || []).filter((s) => (domainB.status || []).includes(s)).length,
     sameRegistrar: normalizeString(domainA.registrar) === normalizeString(domainB.registrar) && Boolean(domainA.registrar),
     sameDnsProvider: normalizeString(dnsProvA) === normalizeString(dnsProvB),
     sameMailProvider: mailProvA !== 'No MX Records Listed' && mailProvA !== 'No MX Records' && mailProvA === mailProvB,
@@ -1106,18 +1333,16 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
     sameSubnet24: sameSubnet,
     sameTlsSubjectOrg: Boolean(domainA.tlsSubjectOrg && domainB.tlsSubjectOrg && normalizeString(domainA.tlsSubjectOrg) === normalizeString(domainB.tlsSubjectOrg)),
     sharedVerificationTokensCount: sharedTokens.length,
-    sharedCtSubdomains: uniqueSharedSubs,
+    sharedAnalyticsIds,
+    sharedCopyrightEntities,
+    sharedExternalDomains,
+    sharedPassiveDnsIps,
     sameSoaRname,
-    sameSoaMname,
     sharedPtrHostnames,
     sharedSpfIps,
     sameDmarcRua: dmarcRuaMatch,
     sameDmarcRuf: dmarcRufMatch,
     sharedDkimTargets,
-    createdDeltaSeconds,
-    updatedDeltaSeconds,
-    isCreationClustered,
-    isUpdateClustered,
     linkages,
     overallAttributionVerdict,
   };
@@ -1141,7 +1366,7 @@ export function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomai
   };
 }
 
-export function computeTextDiff(textA: string, textB: string, labelA = 'Domain A', labelB = 'Domain B'): TextDiffLine[] {
+function computeTextDiff(textA: string, textB: string, labelA = 'Domain A', labelB = 'Domain B'): TextDiffLine[] {
   const normalizedA = formatCanonicalJsonText(textA);
   const normalizedB = formatCanonicalJsonText(textB);
   const linesA = normalizedA.split(/\r?\n/).map((l) => l.trimEnd());
@@ -1366,7 +1591,7 @@ function inferClientMailProvider(mxRecords: string[]): string {
 
 async function lookupClientIpAsn(
   ip: string
-): Promise<{ asn?: string; asnName?: string; bgpPrefix?: string; subnet24?: string }> {
+): Promise<{ asn?: string; asnName?: string; subnet24?: string }> {
   if (!ip || !ip.includes('.')) return {};
   const octets = ip.trim().split('.');
   if (octets.length !== 4 || octets.some((o) => !/^\d+$/.test(o))) return {};
@@ -1382,7 +1607,6 @@ async function lookupClientIpAsn(
     if (rawTxt) {
       const parts = rawTxt.split('|').map((s) => s.trim());
       const rawAsn = (parts[0] || '').split(/\s+/)[0];
-      const bgpPrefix = parts[1] || undefined;
       if (rawAsn && /^\d+$/.test(rawAsn)) {
         const asn = `AS${rawAsn}`;
         let asnName: string | undefined;
@@ -1396,12 +1620,12 @@ async function lookupClientIpAsn(
             asnName = nparts[nparts.length - 1] || undefined;
           }
         } catch {}
-        return { asn, asnName, bgpPrefix, subnet24 };
+        return { asn, asnName, subnet24 };
       }
     }
   } catch {}
 
-  // 2. Fallback: RIPEstat network-info + ipwho.is (both CORS *)
+  // 2. Fallback: RIPEstat network-info (CORS *)
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 4000);
@@ -1413,11 +1637,9 @@ async function lookupClientIpAsn(
     if (res.ok) {
       const json = await res.json();
       const rawAsn = Array.isArray(json?.data?.asns) ? json.data.asns[0] : undefined;
-      const bgpPrefix = typeof json?.data?.prefix === 'string' ? json.data.prefix : undefined;
       if (rawAsn) {
         return {
           asn: `AS${String(rawAsn).replace(/^AS/i, '')}`,
-          bgpPrefix,
           subnet24,
         };
       }
@@ -1431,6 +1653,10 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
   crtSubdomainsCount: number;
   crtSubdomainsSample: string[];
   crtWildcardFound: boolean;
+  tlsIssuerOrg?: string;
+  tlsIssuerCn?: string;
+  tlsValidityNotBefore?: string;
+  tlsValidityNotAfter?: string;
 }> {
   const cleanApex = (extractApexDomain(rootDomain) || rootDomain)
     .toLowerCase()
@@ -1438,19 +1664,35 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
     .replace(/^\.+|\.+$/g, '');
   const subs = new Set<string>();
   let crtWildcardFound = false;
+  let tlsIssuerOrg: string | undefined;
+  let tlsIssuerCn: string | undefined;
+  let tlsValidityNotBefore: string | undefined;
+  let tlsValidityNotAfter: string | undefined;
 
   const queryCertspotter = async () => {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5500);
       const res = await fetch(
-        `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(cleanApex)}&include_subdomains=true&expand=dns_names`,
+        `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(cleanApex)}&include_subdomains=true&expand=dns_names&expand=issuer`,
         { headers: { Accept: 'application/json' }, signal: controller.signal }
       );
       clearTimeout(timer);
       if (res.ok) {
         const items = await res.json();
         if (Array.isArray(items)) {
+          // Prefer non-revoked latest cert for TLS issuer/validity metadata
+          const preferred = items.find((it: any) => it && !it.revoked && it.issuer) || items[0];
+          if (preferred) {
+            const issuerName = String(preferred.issuer?.name || '');
+            const orgMatch = issuerName.match(/(?:^|,\s*)O=([^,]+)/);
+            const cnMatch = issuerName.match(/(?:^|,\s*)CN=([^,]+)/);
+            tlsIssuerOrg = orgMatch?.[1]?.trim() || preferred.issuer?.friendly_name || undefined;
+            tlsIssuerCn = cnMatch?.[1]?.trim() || undefined;
+            if (preferred.not_before) tlsValidityNotBefore = String(preferred.not_before);
+            if (preferred.not_after) tlsValidityNotAfter = String(preferred.not_after);
+          }
+
           for (const item of items) {
             if (!Array.isArray(item?.dns_names)) continue;
             for (const name of item.dns_names) {
@@ -1496,11 +1738,197 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
     crtSubdomainsCount: sorted.length,
     crtSubdomainsSample: sorted.slice(0, 120),
     crtWildcardFound,
+    tlsIssuerOrg,
+    tlsIssuerCn,
+    tlsValidityNotBefore,
+    tlsValidityNotAfter,
   };
 }
 
+async function fetchClientPassiveDns(cleanDomain: string, rootDomain: string): Promise<{
+  passiveDnsDisplay: string[];
+  passiveDnsIps: string[];
+}> {
+  const ipSet = new Set<string>();
+  const displaySet = new Set<string>();
+
+  const queryHackerTarget = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(
+        `https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(rootDomain)}`,
+        { signal: controller.signal }
+      );
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const text = await res.text();
+      if (!text || text.includes('error') || text.includes('API count exceeded')) return;
+      for (const line of text.split('\n').slice(0, 30)) {
+        const [hostRaw, ipRaw] = line.split(',');
+        const host = hostRaw?.trim().toLowerCase();
+        const ip = ipRaw?.trim();
+        if (!host || !ip) continue;
+        if (/^[\da-fA-F:.]+$/.test(ip)) ipSet.add(ip);
+        displaySet.add(`${ip.includes(':') ? 'AAAA' : 'A'} | ${host} -> ${ip}`);
+      }
+    } catch {}
+  };
+
+  const queryRipeDnsChain = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(
+        `https://stat.ripe.net/data/dns-chain/data.json?resource=${encodeURIComponent(cleanDomain)}`,
+        { headers: { Accept: 'application/json' }, signal: controller.signal }
+      );
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const json = await res.json();
+      const forwardNodes = json?.data?.forward_nodes;
+      if (forwardNodes && typeof forwardNodes === 'object') {
+        for (const [hostKey, vals] of Object.entries(forwardNodes)) {
+          if (!Array.isArray(vals)) continue;
+          for (const rawAns of vals) {
+            const ans = String(rawAns).trim();
+            if (!ans) continue;
+            if (/^[\da-fA-F:.]+$/.test(ans)) ipSet.add(ans);
+            displaySet.add(`${ans.includes(':') ? 'AAAA' : 'A'} | ${hostKey.toLowerCase()} -> ${ans}`);
+          }
+        }
+      }
+    } catch {}
+  };
+
+  await Promise.all([queryHackerTarget(), queryRipeDnsChain()]);
+
+  return {
+    passiveDnsDisplay: Array.from(displaySet).sort().slice(0, 40),
+    passiveDnsIps: Array.from(ipSet).sort(),
+  };
+}
+
+/**
+ * Pure-browser zero-execution web reconnaissance when target allows CORS.
+ * Strictly reads bounded UTF-8 text and parses HTML in detached inert DOMParser;
+ * NEVER executes fetched JS or injects HTML into the live DOM.
+ */
+async function probeClientWebPageAndHeaders(cleanDomain: string): Promise<{
+  httpWebServer?: string;
+  httpStatusCode?: number;
+  httpHeaderSummary?: string[];
+  cspExternalDomains?: string[];
+  webReconMode: 'browser-cors' | 'cors-blocked';
+  webFinalUrl?: string;
+  inspectedScriptsCount?: number;
+  htmlTitle?: string;
+  htmlDescription?: string;
+  htmlGenerator?: string;
+  htmlAuthor?: string;
+  htmlRobots?: string;
+  canonicalUrl?: string;
+  openGraphSiteName?: string;
+  twitterSite?: string;
+  htmlVerificationTokens?: Array<{ provider: string; token: string; raw: string }>;
+  domMarkers?: string[];
+  domStats?: string;
+  scriptUrls?: string[];
+  resourceSummary?: string[];
+  analyticsIds?: string[];
+  footerCopyrights?: string[];
+  copyrightEntities?: string[];
+  technologies?: string[];
+  externalDomains?: string[];
+}> {
+  const targetUrl = `https://${cleanDomain}`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3800);
+    const res = await fetch(targetUrl, {
+      method: 'GET',
+      mode: 'cors',
+      credentials: 'omit',
+      headers: { Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    const sanitizedHeaders = sanitizeHttpHeaders(res.headers);
+    const finalUrl = res.url || targetUrl;
+    const htmlText = await readBoundedResponseText(res, MAX_HTML_RECON_BYTES);
+    const recon = analyzeHtmlRecon(htmlText, finalUrl, sanitizedHeaders, cleanDomain);
+
+    // Optional bounded plain-text scan of up to 2 CORS-allowed first-party scripts (NEVER executed)
+    const analyticsSet = new Set<string>(recon.analyticsIds);
+    const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, cleanDomain, 2);
+    let inspectedScriptsCount = 0;
+
+    if (candidateScripts.length > 0) {
+      const scriptTexts = await Promise.allSettled(
+        candidateScripts.map(async (sUrl) => {
+          const sc = new AbortController();
+          const st = setTimeout(() => sc.abort(), 2200);
+          try {
+            const sr = await fetch(sUrl, {
+              method: 'GET',
+              mode: 'cors',
+              credentials: 'omit',
+              signal: sc.signal,
+            });
+            clearTimeout(st);
+            if (!sr.ok) return null;
+            return await readBoundedResponseText(sr, MAX_SCRIPT_TEXT_BYTES);
+          } catch {
+            clearTimeout(st);
+            return null;
+          }
+        })
+      );
+      for (const r of scriptTexts) {
+        if (r.status === 'fulfilled' && r.value) {
+          inspectedScriptsCount++;
+          extractAnalyticsIdsFromText(r.value).forEach((id) => analyticsSet.add(id));
+        }
+      }
+    }
+
+    return {
+      httpWebServer: sanitizedHeaders['server'] || undefined,
+      httpStatusCode: res.status,
+      httpHeaderSummary: recon.httpHeaderSummary,
+      cspExternalDomains: recon.cspExternalDomains,
+      webReconMode: 'browser-cors',
+      webFinalUrl: finalUrl,
+      inspectedScriptsCount,
+      htmlTitle: recon.htmlTitle,
+      htmlDescription: recon.htmlDescription,
+      htmlGenerator: recon.htmlGenerator,
+      htmlAuthor: recon.htmlAuthor,
+      htmlRobots: recon.htmlRobots,
+      canonicalUrl: recon.canonicalUrl,
+      openGraphSiteName: recon.openGraphSiteName,
+      twitterSite: recon.twitterSite,
+      htmlVerificationTokens: recon.htmlVerificationTokens,
+      domMarkers: recon.domMarkers,
+      domStats: recon.domStats,
+      scriptUrls: recon.scriptUrls,
+      resourceSummary: recon.resourceSummary,
+      analyticsIds: Array.from(analyticsSet).sort(),
+      footerCopyrights: recon.footerCopyrights,
+      copyrightEntities: recon.copyrightEntities,
+      technologies: recon.technologies,
+      externalDomains: recon.externalDomains,
+    };
+  } catch {
+    return {
+      webReconMode: 'cors-blocked',
+    };
+  }
+}
+
 // Fallback Browser RDAP, DoH & OSINT Query (used on GitHub Pages static hosting or when backend is unavailable)
-export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> {
+async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> {
   const clean = sanitizeDomainInput(domain);
   const root = extractApexDomain(clean) || clean;
   const tld = root.split('.').pop() || '';
@@ -1508,14 +1936,12 @@ export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainR
   let rdapData: any = null;
   let rawText = '';
   let registrar = 'Protected / Redacted';
-  let ianaId: string | undefined;
   let createdDate: string | undefined;
   let updatedDate: string | undefined;
   let expiresDate: string | undefined;
   let abuseContactEmail: string | undefined;
   let registrantCountry: string | undefined;
   let registrantState: string | undefined;
-  let registrantCity: string | undefined;
   let registrantOrg: string | undefined;
   const status: string[] = [];
   const nameservers: string[] = [];
@@ -1559,8 +1985,8 @@ export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainR
     }
   };
 
-  // Run RDAP, DoH DNS, and CT Subdomain discovery concurrently
-  const [, nsRes, aRes, aaaaRes, mxRes, dsRes, ctData] = await Promise.all([
+  // Run RDAP, DoH DNS, CT + Certspotter TLS, Passive DNS, and CORS-safe Web Recon concurrently
+  const [, nsRes, aRes, aaaaRes, mxRes, dsRes, ctData, pdnsData, webData] = await Promise.all([
     fetchRdap(),
     queryBrowserDoh(clean, 'NS'),
     queryBrowserDoh(clean, 'A'),
@@ -1568,6 +1994,8 @@ export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainR
     queryBrowserDoh(clean, 'MX'),
     queryBrowserDoh(root, 'DS'),
     fetchClientCtSubdomains(root),
+    fetchClientPassiveDns(clean, root),
+    probeClientWebPageAndHeaders(clean),
   ]);
 
   if (rdapData) {
@@ -1592,12 +2020,6 @@ export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainR
             if (registrar === 'Protected / Redacted' && orgVal) registrar = orgVal;
           }
           if (registrar === 'Protected / Redacted' && ent.handle) registrar = String(ent.handle);
-          if (Array.isArray(ent.publicIds)) {
-            const ianaPublicId = ent.publicIds.find(
-              (p: any) => p && typeof p.type === 'string' && p.type.toLowerCase().includes('iana')
-            );
-            if (ianaPublicId && ianaPublicId.identifier !== undefined) ianaId = String(ianaPublicId.identifier);
-          }
         }
         if (roles.includes('abuse')) {
           if (vcardProps) {
@@ -1621,7 +2043,6 @@ export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainR
             }
             const adrItem = vcardProps.find((i: any) => Array.isArray(i) && i[0] === 'adr');
             if (adrItem && Array.isArray(adrItem[3])) {
-              if (adrItem[3][4]) registrantCity = readScalar(adrItem[3][4]) || String(adrItem[3][3] || '');
               if (adrItem[3][5]) registrantState = String(adrItem[3][5]);
               if (adrItem[3][6]) registrantCountry = String(adrItem[3][6]);
             }
@@ -1705,7 +2126,6 @@ export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainR
 
   const ageData = formatDomainAge(createdDate);
   const expData = formatExpirationCountdown(expiresDate);
-  const nameserverRoots = Array.from(new Set(nameservers.map((ns) => extractApexDomain(ns)).filter(Boolean))).sort();
 
   if (!rawText) {
     rawText = [
@@ -1719,15 +2139,10 @@ export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainR
   }
 
   return {
-    queryInput: domain,
     domainName: clean,
     rootDomain: root,
-    tld,
-    fetchedAt: Date.now(),
     source: rdapData ? 'rdap' : 'doh',
     registrar,
-    ianaId,
-    whoisServer: rdapData?.port43 || undefined,
     createdDate,
     updatedDate,
     expiresDate,
@@ -1738,29 +2153,56 @@ export async function fetchClientSideWhois(domain: string): Promise<WhoisDomainR
     status: status.length > 0 ? status : ['ok'],
     dnssec,
     nameservers: nameservers.sort(),
-    nameserverRoots,
     dnsProvider: inferDnsProvider(nameservers),
     aRecords,
     aaaaRecords,
-    mxRecords,
     mailProvider: inferClientMailProvider(mxRecords),
     asn: asnInfo.asn,
     asnName: asnInfo.asnName,
-    bgpPrefix: asnInfo.bgpPrefix,
     subnet24: asnInfo.subnet24,
+    passiveDnsDisplay: pdnsData.passiveDnsDisplay,
+    passiveDnsIps: pdnsData.passiveDnsIps,
+    tlsIssuerOrg: ctData.tlsIssuerOrg,
+    tlsIssuerCn: ctData.tlsIssuerCn,
+    tlsValidityNotBefore: ctData.tlsValidityNotBefore,
+    tlsValidityNotAfter: ctData.tlsValidityNotAfter,
     crtSubdomainsCount: ctData.crtSubdomainsCount,
     crtSubdomainsSample: ctData.crtSubdomainsSample,
     crtWildcardFound: ctData.crtWildcardFound,
+    htmlVerificationTokens: webData.htmlVerificationTokens || [],
+    analyticsIds: webData.analyticsIds || [],
+    footerCopyrights: webData.footerCopyrights || [],
+    copyrightEntities: webData.copyrightEntities || [],
+    httpWebServer: webData.httpWebServer,
+    httpStatusCode: webData.httpStatusCode,
+    httpHeaderSummary: webData.httpHeaderSummary || [],
+    cspExternalDomains: webData.cspExternalDomains || [],
+    webReconMode: webData.webReconMode,
+    webFinalUrl: webData.webFinalUrl,
+    inspectedScriptsCount: webData.inspectedScriptsCount || 0,
+    htmlTitle: webData.htmlTitle,
+    htmlDescription: webData.htmlDescription,
+    htmlGenerator: webData.htmlGenerator,
+    htmlAuthor: webData.htmlAuthor,
+    htmlRobots: webData.htmlRobots,
+    canonicalUrl: webData.canonicalUrl,
+    openGraphSiteName: webData.openGraphSiteName,
+    twitterSite: webData.twitterSite,
+    domMarkers: webData.domMarkers || [],
+    domStats: webData.domStats,
+    scriptUrls: webData.scriptUrls || [],
+    resourceSummary: webData.resourceSummary || [],
+    technologies: webData.technologies || [],
+    externalDomains: webData.externalDomains || [],
     registrantOrg,
     registrantCountry,
     registrantState,
-    registrantCity,
     abuseContactEmail,
     rawText,
   };
 }
 
-export async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
+async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
   const clean = sanitizeDomainInput(domain);
   if (!isValidDomainFormat(clean)) {
     throw new Error(`Invalid domain syntax: "${domain}". Please enter a valid fully qualified domain name.`);

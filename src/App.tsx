@@ -9,12 +9,13 @@ import { WhoisDiffMatrix } from './components/WhoisDiffMatrix';
 import { OsintTopologyMap } from './components/OsintTopologyMap';
 import { OsintTimelineView } from './components/OsintTimelineView';
 import { OsintSubdomainIntersection } from './components/OsintSubdomainIntersection';
+import { OsintWebSurfaceView } from './components/OsintWebSurfaceView';
 import { WhoisRawDiffView } from './components/WhoisRawDiffView';
 import { WhoisExportModal } from './components/WhoisExportModal';
 import { WhoisFooter } from './components/WhoisFooter';
-import { Table, Network, Calendar, Layers, FileCode } from 'lucide-react';
+import { Table, Network, Calendar, Layers, FileCode, Code2 } from 'lucide-react';
 
-type OsintViewMode = 'matrix' | 'topology' | 'timeline' | 'subdomains' | 'raw_diff';
+type OsintViewMode = 'matrix' | 'topology' | 'timeline' | 'subdomains' | 'web_recon' | 'raw_diff';
 
 export default function App() {
   const [domainA, setDomainA] = useState<string>('');
@@ -146,7 +147,6 @@ export default function App() {
           onChangeDomainA={handleDomainAChange}
           onChangeDomainB={handleDomainBChange}
           onCompare={() => handleCompare(domainA, domainB)}
-          onReset={handleReset}
           isLoading={isLoading}
           error={error}
         />
@@ -162,6 +162,7 @@ export default function App() {
               <div className="flex items-center gap-1 flex-1 flex-wrap sm:flex-nowrap">
                 {[
                   { id: 'matrix', label: 'DELTA MATRIX', icon: Table },
+                  { id: 'web_recon', label: 'WEB RECON & PDNS', icon: Code2 },
                   { id: 'topology', label: 'TOPOLOGY GRAPH', icon: Network },
                   { id: 'timeline', label: 'INCEPTION TIMELINE', icon: Calendar },
                   { id: 'subdomains', label: 'CT SUBDOMAINS', icon: Layers },
@@ -193,6 +194,10 @@ export default function App() {
             {/* Active View Mode */}
             {activeTab === 'matrix' && (
               <WhoisDiffMatrix diff={diffResult} />
+            )}
+
+            {activeTab === 'web_recon' && (
+              <OsintWebSurfaceView diff={diffResult} />
             )}
 
             {activeTab === 'topology' && (

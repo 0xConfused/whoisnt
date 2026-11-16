@@ -19,7 +19,7 @@ interface TimelineEvent {
   label: string;
   dateStr: string;
   timestamp: number;
-  type: 'created' | 'updated' | 'expires' | 'now';
+  type: 'created' | 'updated' | 'expires';
   isSignificant?: boolean;
   notes?: string;
 }
@@ -127,7 +127,6 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
           dateStr: formatDateUtc(ts),
           timestamp: ts,
           type: 'updated',
-          notes: 'Routine authoritative refresh',
         });
       }
     }
@@ -178,7 +177,6 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
           dateStr: formatDateUtc(ts),
           timestamp: ts,
           type: 'updated',
-          notes: 'Routine authoritative refresh',
         });
       }
     }
@@ -228,7 +226,7 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
 
   const computeDomainTrackEvents = (domainKey: 'A' | 'B') => {
     const domainEvents = events
-      .filter((e) => e.domainKey === domainKey && e.type !== 'now')
+      .filter((e) => e.domainKey === domainKey)
       .map((ev) => ({ ev, pos: getPercentage(ev.timestamp), tier: 0 }));
 
     const tierLastPos = [-Infinity, -Infinity, -Infinity];
