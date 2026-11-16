@@ -410,7 +410,7 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
           <table className="w-full text-left border-collapse font-mono text-xs">
             <thead>
               <tr className="bg-[#141414] border-b border-[#383838] text-[10px] text-[#8c8c8c] uppercase tracking-wider select-none">
-                <th className="py-2 px-4 font-semibold w-28">Target</th>
+                <th className="py-2 px-4 font-semibold min-w-28">Target</th>
                 <th className="py-2 px-4 font-semibold w-64">Milestone</th>
                 <th className="py-2 px-4 font-semibold w-36">Date (UTC)</th>
                 <th className="py-2 px-4 font-semibold w-48">Horizon / Age</th>
@@ -431,10 +431,10 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
                       isHovered ? 'bg-[#1a1a1a]' : 'hover:bg-[#1a1a1a]/80'
                     }`}
                   >
-                    <td className="py-2.5 px-4 align-middle">
+                    <td className="py-2.5 px-4 align-middle whitespace-nowrap">
                       <span className="flex items-center font-bold">
                         <span className={ev.domainKey === 'A' ? 'text-[#c30800]' : 'text-[#c300bb]'}>
-                          {ev.domainKey === 'A' ? 'Domain A' : 'Domain B'}
+                          {ev.domainName}
                         </span>
                       </span>
                     </td>

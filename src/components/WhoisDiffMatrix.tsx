@@ -189,7 +189,7 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
     return fieldsBeforeCategory.filter((field) => field.category === activeCategory);
   }, [fieldsBeforeCategory, activeCategory]);
 
-  // Group filtered fields by category for clean section breaks
+  // Group filtered fields by category and alphabetize sections and rows within each section
   const groupedFields = useMemo(() => {
     const groups: Record<string, FieldDiffItem[]> = {};
     filteredFields.forEach((field) => {
@@ -198,7 +198,21 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
       }
       groups[field.category].push(field);
     });
-    return groups;
+
+    const sortedGroups: Record<string, FieldDiffItem[]> = {};
+    const sortedCategoryKeys = Object.keys(groups).sort((a, b) => {
+      const labelA = CATEGORY_CONFIG[a]?.label || a;
+      const labelB = CATEGORY_CONFIG[b]?.label || b;
+      return labelA.localeCompare(labelB, undefined, { sensitivity: 'base' });
+    });
+
+    for (const catKey of sortedCategoryKeys) {
+      sortedGroups[catKey] = [...groups[catKey]].sort((a, b) =>
+        a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' })
+      );
+    }
+
+    return sortedGroups;
   }, [filteredFields]);
 
   const renderArrayValues = (
@@ -210,9 +224,12 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
       return <span className="text-[#737373] italic font-mono text-xs">No records announced</span>;
     }
 
+    const sortedValues = [...values].sort((a, b) =>
+      String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' })
+    );
     const limit = fieldId === 'status' ? 2 : 3;
-    const isOverLimit = values.length > limit;
-    const displayedValues = !isExpanded && isOverLimit ? values.slice(0, limit) : values;
+    const isOverLimit = sortedValues.length > limit;
+    const displayedValues = !isExpanded && isOverLimit ? sortedValues.slice(0, limit) : sortedValues;
 
     return (
       <div className="space-y-1.5 font-mono text-xs">
