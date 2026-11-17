@@ -17,6 +17,56 @@ import { Table, Network, Calendar, Layers, FileCode, Code2 } from 'lucide-react'
 
 type OsintViewMode = 'matrix' | 'topology' | 'timeline' | 'subdomains' | 'web_recon' | 'raw_diff';
 
+const NAMED_PARAM_KEYS = new Set(['a', 'b', 'domainA', 'domainB']);
+const FORBIDDEN_PARAM_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function parseSitesFromUrlSearch(search: string): { siteA: string; siteB: string; urlError: string | null } {
+  if (!search) return { siteA: '', siteB: '', urlError: null };
+  if (search.length > 2048) {
+    return { siteA: '', siteB: '', urlError: 'URL query parameters exceed safe maximum length.' };
+  }
+
+  const params = new URLSearchParams(search);
+  const namedA = params.get('a') || params.get('domainA') || '';
+  const namedB = params.get('b') || params.get('domainB') || '';
+
+  const bareTokens: string[] = [];
+  for (const [key, value] of params.entries()) {
+    const trimmedKey = key.trim();
+    if (!trimmedKey || NAMED_PARAM_KEYS.has(trimmedKey) || FORBIDDEN_PARAM_KEYS.has(trimmedKey)) continue;
+    if (value === '' || /^https?:\/\//i.test(trimmedKey) || trimmedKey.includes('/') || trimmedKey.includes('?')) {
+      bareTokens.push(trimmedKey);
+      if (bareTokens.length >= 2) break;
+    }
+  }
+
+  if (bareTokens.length === 1 && bareTokens[0].includes(',')) {
+    const parts = bareTokens[0]
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 2);
+    bareTokens.splice(0, 1, ...parts);
+  }
+
+  const rawA = namedA || bareTokens.shift() || '';
+  const rawB = namedB || bareTokens.shift() || '';
+
+  const cleanA = rawA ? sanitizeDomainInput(rawA) : '';
+  const cleanB = rawB ? sanitizeDomainInput(rawB) : '';
+
+  const validA = cleanA && isValidDomainFormat(cleanA) ? cleanA : '';
+  const validB = cleanB && isValidDomainFormat(cleanB) ? cleanB : '';
+
+  const hasInvalidParam = Boolean((rawA && !validA) || (rawB && !validB));
+
+  return {
+    siteA: validA,
+    siteB: validB,
+    urlError: hasInvalidParam ? 'Invalid or disallowed domain parameter in URL. Only valid public domain names are permitted.' : null,
+  };
+}
+
 export default function App() {
   const [domainA, setDomainA] = useState<string>('');
   const [domainB, setDomainB] = useState<string>('');
@@ -55,7 +105,7 @@ export default function App() {
   }, [diffResult]);
 
   const handleCompare = useCallback(
-    async (targetA = domainA, targetB = domainB) => {
+    async (targetA = domainA, targetB = domainB, syncUrl = true) => {
       const cleanA = sanitizeDomainInput(targetA);
       const cleanB = sanitizeDomainInput(targetB);
 
@@ -65,17 +115,26 @@ export default function App() {
         return;
       }
 
-      if (!isValidDomainFormat(cleanA)) {
-        if (targetA.trim()) {
-          setError(`Domain A "${targetA}" is invalid. Please enter a valid domain (e.g. example.com).`);
-        }
+      if (targetA.trim() && !isValidDomainFormat(cleanA)) {
+        setError('Domain A is invalid or disallowed. Please enter a valid public domain (e.g. example.com).');
         return;
       }
-      if (!isValidDomainFormat(cleanB)) {
-        if (targetB.trim()) {
-          setError(`Domain B "${targetB}" is invalid. Please enter a valid domain (e.g. example.org).`);
-        }
+      if (targetB.trim() && !isValidDomainFormat(cleanB)) {
+        setError('Domain B is invalid or disallowed. Please enter a valid public domain (e.g. example.org).');
         return;
+      }
+
+      if (cleanA && cleanA !== targetA) setDomainA(cleanA);
+      if (cleanB && cleanB !== targetB) setDomainB(cleanB);
+
+      if (syncUrl && (cleanA || cleanB)) {
+        const nextSearch =
+          cleanA && cleanB
+            ? `?${encodeURIComponent(cleanA)}&${encodeURIComponent(cleanB)}`
+            : `?${encodeURIComponent(cleanA || cleanB)}`;
+        if (window.location.search !== nextSearch) {
+          window.history.pushState(null, '', `${window.location.pathname}${nextSearch}${window.location.hash}`);
+        }
       }
 
       setIsLoading(true);
@@ -95,20 +154,26 @@ export default function App() {
     [domainA, domainB]
   );
 
-  // Initial lookup on mount if query params are provided
+  const handleCompareRef = useRef(handleCompare);
+  handleCompareRef.current = handleCompare;
+
+  // Initial lookup on mount and browser back/forward navigation
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const paramA = params.get('a') || params.get('domainA');
-    const paramB = params.get('b') || params.get('domainB');
+    const syncFromUrl = () => {
+      const { siteA, siteB, urlError } = parseSitesFromUrlSearch(window.location.search);
+      setDomainA(siteA);
+      setDomainB(siteB);
+      if ((siteA || siteB) && !urlError) {
+        handleCompareRef.current(siteA, siteB, false);
+      } else {
+        setDiffResult(null);
+        setError(urlError);
+      }
+    };
 
-    const initialA = paramA ? sanitizeDomainInput(paramA) : '';
-    const initialB = paramB ? sanitizeDomainInput(paramB) : '';
-
-    setDomainA(initialA);
-    setDomainB(initialB);
-    if (initialA && initialB) {
-      handleCompare(initialA, initialB);
-    }
+    syncFromUrl();
+    window.addEventListener('popstate', syncFromUrl);
+    return () => window.removeEventListener('popstate', syncFromUrl);
   }, []);
 
   const handleDomainAChange = (val: string) => {
@@ -124,14 +189,17 @@ export default function App() {
     setDomainB('');
     setDiffResult(null);
     setError(null);
+    if (window.location.search) {
+      window.history.pushState(null, '', `${window.location.pathname}${window.location.hash}`);
+    }
   };
 
   return (
     <div className="min-h-screen bg-[#0d0d0d] text-[#f0f0f0] flex flex-col antialiased selection:bg-[#c30800] selection:text-[#f3f3f7]">
       {/* Top Header with Brand Lock, Export, and Reset */}
       <WhoisDiffHeader
-        domainA={diffResult?.domainA.domainName || (domainA ? sanitizeDomainInput(domainA) : undefined)}
-        domainB={diffResult?.domainB.domainName || (domainB ? sanitizeDomainInput(domainB) : undefined)}
+        domainA={diffResult?.isSingleDomain ? (domainB.trim() && !domainA.trim() ? undefined : diffResult.domainA.domainName) : (diffResult?.domainA.domainName || (isValidDomainFormat(sanitizeDomainInput(domainA)) ? sanitizeDomainInput(domainA) : undefined))}
+        domainB={diffResult?.isSingleDomain ? (domainB.trim() && !domainA.trim() ? diffResult.domainA.domainName : undefined) : (diffResult?.domainB?.domainName || (isValidDomainFormat(sanitizeDomainInput(domainB)) ? sanitizeDomainInput(domainB) : undefined))}
         isComparing={isLoading}
         hasDiffData={Boolean(diffResult)}
         onOpenExport={() => setShowExportModal(true)}
@@ -157,16 +225,16 @@ export default function App() {
             {/* Single bar tabs navigation */}
             <div
               ref={tabBarRef}
-              className="sticky top-[var(--topbar-height,65px)] z-30 bg-[#0d0d0d]/95 backdrop-blur-md flex items-center border-b border-[#383838] pb-0 w-full overflow-x-auto no-scrollbar"
+              className="sticky top-[var(--topbar-height,65px)] z-40 bg-[#0d0d0d] flex items-center border-b border-[#383838] pb-0 w-full overflow-x-auto no-scrollbar"
             >
               <div className="flex items-center gap-1 flex-1 flex-wrap sm:flex-nowrap">
                 {[
-                  { id: 'matrix', label: 'DELTA MATRIX', icon: Table },
+                  { id: 'matrix', label: diffResult.isSingleDomain ? 'OSINT MATRIX' : 'DELTA MATRIX', icon: Table },
                   { id: 'web_recon', label: 'WEB RECON & PDNS', icon: Code2 },
                   { id: 'topology', label: 'TOPOLOGY GRAPH', icon: Network },
                   { id: 'timeline', label: 'INCEPTION TIMELINE', icon: Calendar },
                   { id: 'subdomains', label: 'CT SUBDOMAINS', icon: Layers },
-                  { id: 'raw_diff', label: 'RAW BUFFER DIFF', icon: FileCode },
+                  { id: 'raw_diff', label: diffResult.isSingleDomain ? 'RAW BUFFER' : 'RAW BUFFER DIFF', icon: FileCode },
                 ].map((tab) => {
                   const Icon = tab.icon;
                   const isActive = activeTab === tab.id;
@@ -228,7 +296,7 @@ export default function App() {
               OSINT Difference Engine Idle
             </h3>
             <p className="max-w-md mx-auto text-xs text-[#8c8c8c] font-mono leading-relaxed">
-              Enter two domain names into the side-by-side boxes above to perform real-time difference analysis across registration, BGP routing, Certificate Transparency, and security locks.
+              Enter one or two domain names above to inspect authoritative WHOIS, BGP routing, Certificate Transparency, and web reconnaissance intelligence.
             </p>
           </div>
         )}

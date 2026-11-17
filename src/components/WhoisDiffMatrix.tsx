@@ -124,6 +124,7 @@ const isValueUnavailable = (val: string | string[] | null | undefined): boolean 
 
 export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
   const { domainA, domainB, fieldDiffs } = diff;
+  const isSingle = Boolean(diff.isSingleDomain || !domainB);
 
   const [activeCategory, setActiveCategory] = useState<FilterCategory>('all');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
@@ -146,7 +147,7 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
     const observer = new ResizeObserver(updateTheadHeight);
     if (theadRef.current) observer.observe(theadRef.current);
     return () => observer.disconnect();
-  }, [domainA.domainName, domainB.domainName]);
+  }, [domainA.domainName, domainB?.domainName]);
 
   const toggleRowExpand = useCallback((id: string) => {
     setExpandedRowIds((prev) => {
@@ -172,16 +173,22 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
         return false;
       }
 
-      // Status filter
-      if (statusFilter === 'diff_only' && field.status === 'MATCH') {
-        return false;
-      }
-      if (statusFilter === 'match_only' && field.status !== 'MATCH') {
-        return false;
+      // Status filter (only relevant in two-domain comparison mode)
+      if (!isSingle) {
+        if (statusFilter === 'diff_only' && field.status === 'MATCH') {
+          return false;
+        }
+        if (statusFilter === 'match_only' && field.status !== 'MATCH') {
+          return false;
+        }
       }
 
       // Hide redacted, unknown, or unavailable rows
-      if (hideUnavailable && isValueUnavailable(field.valueA) && isValueUnavailable(field.valueB)) {
+      if (
+        hideUnavailable &&
+        isValueUnavailable(field.valueA) &&
+        (isSingle || isValueUnavailable(field.valueB))
+      ) {
         return false;
       }
 
@@ -189,7 +196,11 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim();
         const strA = Array.isArray(field.valueA) ? field.valueA.join(' ') : String(field.valueA || '');
-        const strB = Array.isArray(field.valueB) ? field.valueB.join(' ') : String(field.valueB || '');
+        const strB = !isSingle
+          ? Array.isArray(field.valueB)
+            ? field.valueB.join(' ')
+            : String(field.valueB || '')
+          : '';
         const matchLabel = field.label.toLowerCase().includes(q);
         const matchRfc = (field.rfcOrSpec || '').toLowerCase().includes(q);
         const matchValA = strA.toLowerCase().includes(q);
@@ -199,7 +210,7 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
 
       return true;
     });
-  }, [fieldDiffs, hideUnavailable, statusFilter, searchQuery]);
+  }, [fieldDiffs, hideUnavailable, statusFilter, searchQuery, isSingle]);
 
   const filteredFields = useMemo(() => {
     if (activeCategory === 'all') return fieldsBeforeCategory;
@@ -319,7 +330,7 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
     <div
       ref={containerRef}
       id="whois-diff-matrix-table"
-      className="bg-[#141414] border border-[#383838] rounded-none overflow-x-clip flex flex-col relative mb-6"
+      className="bg-[#141414] border border-[#383838] rounded-none overflow-x-clip flex flex-col relative z-0 isolate mb-6"
     >
       <div className="h-[2px] w-full bg-gradient-to-r from-[#c30800] via-[#c300bb] to-[#bbc300]" />
 
@@ -357,7 +368,7 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
           <input
             type="text"
             maxLength={200}
-            placeholder="Filter attributes..."
+            placeholder="Filter attributes"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-8 pr-3 py-1 bg-[#141414] border border-[#2e2e2e] hover:border-[#383838] rounded-none text-xs text-[#f0f0f0] placeholder-[#737373] focus:outline-none focus:border-[#c30800]/60 font-mono transition-colors"
@@ -365,45 +376,47 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div
-            role="group"
-            aria-label="Diff status filter"
-            className="inline-flex items-center bg-[#0d0d0d] border border-[#383838] rounded-none p-0.5 gap-0.5"
-          >
-            <button
-              type="button"
-              onClick={() => setStatusFilter('all')}
-              className={`px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-none border cursor-pointer font-semibold transition-colors ${
-                statusFilter === 'all'
-                  ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
-                  : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
-              }`}
+          {!isSingle && (
+            <div
+              role="group"
+              aria-label="Diff status filter"
+              className="inline-flex items-center bg-[#0d0d0d] border border-[#383838] rounded-none p-0.5 gap-0.5"
             >
-              ALL
-            </button>
-            <button
-              type="button"
-              onClick={() => setStatusFilter('diff_only')}
-              className={`px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-none border cursor-pointer font-semibold transition-colors ${
-                statusFilter === 'diff_only'
-                  ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
-                  : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
-              }`}
-            >
-              DIFFS
-            </button>
-            <button
-              type="button"
-              onClick={() => setStatusFilter('match_only')}
-              className={`px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-none border cursor-pointer font-semibold transition-colors ${
-                statusFilter === 'match_only'
-                  ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
-                  : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
-              }`}
-            >
-              MATCHES
-            </button>
-          </div>
+              <button
+                type="button"
+                onClick={() => setStatusFilter('all')}
+                className={`px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-none border cursor-pointer font-semibold transition-colors ${
+                  statusFilter === 'all'
+                    ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
+                    : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
+                }`}
+              >
+                ALL
+              </button>
+              <button
+                type="button"
+                onClick={() => setStatusFilter('diff_only')}
+                className={`px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-none border cursor-pointer font-semibold transition-colors ${
+                  statusFilter === 'diff_only'
+                    ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
+                    : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
+                }`}
+              >
+                DIFFS
+              </button>
+              <button
+                type="button"
+                onClick={() => setStatusFilter('match_only')}
+                className={`px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-none border cursor-pointer font-semibold transition-colors ${
+                  statusFilter === 'match_only'
+                    ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
+                    : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
+                }`}
+              >
+                MATCHES
+              </button>
+            </div>
+          )}
           <button
             type="button"
             onClick={() => setHideUnavailable((prev) => !prev)}
@@ -427,7 +440,12 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
             No OSINT attributes match the active filter criteria.
           </div>
         ) : (
-          <table className="w-full text-left border-separate border-spacing-0 font-mono text-xs">
+          <table className="w-full table-fixed text-left border-separate border-spacing-0 font-mono text-xs">
+            <colgroup>
+              <col className="w-36 sm:w-56 md:w-64" />
+              <col />
+              {!isSingle && <col />}
+            </colgroup>
             <thead ref={theadRef}>
               <tr className="bg-[#141414] text-[10px] text-[#8c8c8c] uppercase tracking-wider select-none">
                 <th
@@ -440,30 +458,22 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
                   style={{ top: 'var(--matrix-sticky-top, 101px)' }}
                   className="sticky z-20 bg-[#141414] shadow-[inset_0_-1px_0_#383838,inset_1px_0_0_#2e2e2e] py-2 px-3 sm:px-4 font-semibold whitespace-nowrap"
                 >
-                  <div className="flex items-center justify-between gap-2 min-w-0">
-                    <span className="truncate">
-                      <span className="text-[#c30800] font-bold">A: </span>
-                      <span className="text-[#f0f0f0]">{domainA.domainName}</span>
-                    </span>
-                    <span className="text-[9px] text-[#737373] font-normal shrink-0">
-                      {domainA.source.toUpperCase()}
-                    </span>
+                  <div className="truncate">
+                    {!isSingle && <span className="text-[#c30800] font-bold">A: </span>}
+                    <span className="text-[#f0f0f0]">{domainA.domainName}</span>
                   </div>
                 </th>
-                <th
-                  style={{ top: 'var(--matrix-sticky-top, 101px)' }}
-                  className="sticky z-20 bg-[#141414] shadow-[inset_0_-1px_0_#383838,inset_1px_0_0_#2e2e2e] py-2 px-3 sm:px-4 font-semibold whitespace-nowrap"
-                >
-                  <div className="flex items-center justify-between gap-2 min-w-0">
-                    <span className="truncate">
+                {!isSingle && domainB && (
+                  <th
+                    style={{ top: 'var(--matrix-sticky-top, 101px)' }}
+                    className="sticky z-20 bg-[#141414] shadow-[inset_0_-1px_0_#383838,inset_1px_0_0_#2e2e2e] py-2 px-3 sm:px-4 font-semibold whitespace-nowrap"
+                  >
+                    <div className="truncate">
                       <span className="text-[#c300bb] font-bold">B: </span>
                       <span className="text-[#f0f0f0]">{domainB.domainName}</span>
-                    </span>
-                    <span className="text-[9px] text-[#737373] font-normal shrink-0">
-                      {domainB.source.toUpperCase()}
-                    </span>
-                  </div>
-                </th>
+                    </div>
+                  </th>
+                )}
               </tr>
             </thead>
             {(Object.entries(groupedFields) as Array<[string, FieldDiffItem[]]>).map(([catKey, fields]) => {
@@ -475,7 +485,7 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
                   {/* Sticky Category Subheader Row */}
                   <tr className="select-none">
                     <td
-                      colSpan={3}
+                      colSpan={isSingle ? 2 : 3}
                       style={{ top: 'calc(var(--matrix-sticky-top, 101px) + var(--matrix-thead-height, 32px))' }}
                       className="sticky z-10 bg-[#0d0d0d] shadow-[inset_0_1px_0_#383838,inset_0_-1px_0_#383838] py-1.5 px-3 sm:px-4 font-mono text-[10px] font-bold text-[#8c8c8c] uppercase tracking-wider"
                     >
@@ -490,7 +500,8 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
                   {/* Field Indicator Data Rows */}
                   {fields.map((field) => {
                     const isDiff =
-                      field.status === 'DIFF' || field.status === 'ONLY_A' || field.status === 'ONLY_B';
+                      !isSingle &&
+                      (field.status === 'DIFF' || field.status === 'ONLY_A' || field.status === 'ONLY_B');
                     const isArrA = Array.isArray(field.valueA);
                     const isArrB = Array.isArray(field.valueB);
                     const isExpanded = expandedRowIds.has(field.id);
@@ -499,9 +510,11 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
                     const canExpandA = isArrA
                       ? (field.valueA as string[]).length > limit
                       : String(field.valueA ?? '').length > 180;
-                    const canExpandB = isArrB
-                      ? (field.valueB as string[]).length > limit
-                      : String(field.valueB ?? '').length > 180;
+                    const canExpandB = !isSingle
+                      ? isArrB
+                        ? (field.valueB as string[]).length > limit
+                        : String(field.valueB ?? '').length > 180
+                      : false;
                     const canExpandRow = canExpandA || canExpandB;
 
                     const handleRowClick = () => {
@@ -540,7 +553,11 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
                         </td>
 
                         {/* Column 2: Domain A Value */}
-                        <td className={`py-2.5 px-3 sm:px-4 align-top border-r border-b border-[#2e2e2e] ${isDiff ? 'bg-[#c30800]/5' : ''}`}>
+                        <td
+                          className={`py-2.5 px-3 sm:px-4 align-top border-b border-[#2e2e2e] ${
+                            !isSingle ? 'border-r' : ''
+                          } ${isDiff ? 'bg-[#c30800]/5' : ''}`}
+                        >
                           {isArrA
                             ? renderArrayValues(
                                 field.id,
@@ -554,18 +571,20 @@ export const WhoisDiffMatrix: React.FC<WhoisDiffMatrixProps> = ({ diff }) => {
                         </td>
 
                         {/* Column 3: Domain B Value */}
-                        <td className={`py-2.5 px-3 sm:px-4 align-top border-b border-[#2e2e2e] ${isDiff ? 'bg-[#c300bb]/5' : ''}`}>
-                          {isArrB
-                            ? renderArrayValues(
-                                field.id,
-                                field.valueB as string[],
-                                isExpanded
-                              )
-                            : renderSingleValue(
-                                field.valueB,
-                                isExpanded
-                              )}
-                        </td>
+                        {!isSingle && (
+                          <td className={`py-2.5 px-3 sm:px-4 align-top border-b border-[#2e2e2e] ${isDiff ? 'bg-[#c300bb]/5' : ''}`}>
+                            {isArrB
+                              ? renderArrayValues(
+                                  field.id,
+                                  field.valueB as string[],
+                                  isExpanded
+                                )
+                              : renderSingleValue(
+                                  field.valueB,
+                                  isExpanded
+                                )}
+                          </td>
+                        )}
                       </tr>
                     );
                   })}

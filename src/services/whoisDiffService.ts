@@ -9,7 +9,7 @@ import {
   TextDiffLine,
   DiffStatus,
 } from '../types';
-import { extractApexDomain } from '../utils/urlUtils';
+import { extractApexDomain, sanitizeDomainInput, isValidDomainFormat, prioritizeSubdomainsForRecon } from '../utils/urlUtils';
 import { enrichDomainWithBrowserDns, queryBrowserDoh } from './browserDnsService';
 import { canonicalizeJsonStringify, formatCanonicalJsonText } from '../utils/jsonSort';
 import { parseFlexibleDateMs } from '../utils/dateUtils';
@@ -18,30 +18,14 @@ import {
   extractAnalyticsIdsFromText,
   MAX_HTML_RECON_BYTES,
   MAX_SCRIPT_TEXT_BYTES,
+  mergeSubdomainWebRecon,
   readBoundedResponseText,
   sanitizeHttpHeaders,
   selectFirstPartyScriptsForInspection,
+  type SubdomainWebProbeEntry,
 } from '../utils/htmlRecon';
 
-export function sanitizeDomainInput(raw: string): string {
-  if (!raw) return '';
-  let str = raw.trim();
-  str = str.replace(/^[a-zA-Z]+:\/\//, '');
-  str = str.split('/')[0];
-  str = str.split('?')[0];
-  str = str.split('#')[0];
-  str = str.replace(/:\d+$/, '');
-  str = str.replace(/^\.+|\.+$/g, '');
-  return str.toLowerCase();
-}
-
-export function isValidDomainFormat(domain: string): boolean {
-  if (!domain || domain.length < 3 || domain.length > 253) return false;
-  if (!domain.includes('.')) return false;
-  // RFC 1035 / RFC 1123 domain syntax
-  const domainRegex = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-_]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$/;
-  return domainRegex.test(domain);
-}
+export { sanitizeDomainInput, isValidDomainFormat };
 
 function inferDnsProvider(nameservers: string[]): string {
   if (!nameservers || nameservers.length === 0) return 'Undetermined';
@@ -677,7 +661,10 @@ function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomainRecord
     if (d.webReconMode === 'unreachable') return 'Unreachable over HTTP/HTTPS';
     if (!d.httpStatusCode && !d.webFinalUrl) return 'Not available';
     const scriptsNote = d.inspectedScriptsCount ? ` · ${d.inspectedScriptsCount} first-party JS scanned (static text only)` : '';
-    return `HTTP ${d.httpStatusCode || '?'} · ${d.webFinalUrl || `https://${d.domainName}`} [${d.webReconMode || 'direct'}]${scriptsNote}`;
+    const subNote = d.webReconProbedHostsCount
+      ? ` · ${d.webReconReachableHosts?.length || 0}/${d.webReconProbedHostsCount} hosts reachable`
+      : '';
+    return `HTTP ${d.httpStatusCode || '?'} · ${d.webFinalUrl || `https://${d.domainName}`} [${d.webReconMode || 'direct'}]${subNote}${scriptsNote}`;
   };
 
   if (domainA.webReconMode || domainB.webReconMode) {
@@ -685,10 +672,24 @@ function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomainRecord
       id: 'web_recon_status',
       category: 'web',
       label: 'HTTP Probe & Resource Access Mode',
-      rfcOrSpec: 'RFC 9110 / Zero-Exec Static Fetch',
+      rfcOrSpec: 'RFC 9110 / Multi-Subdomain Static Fetch',
       valueA: formatWebStatus(domainA),
       valueB: formatWebStatus(domainB),
       status: compareValues(domainA.webFinalUrl || domainA.webReconMode, domainB.webFinalUrl || domainB.webReconMode),
+    });
+  }
+
+  const hostsA = domainA.webReconReachableHosts || [];
+  const hostsB = domainB.webReconReachableHosts || [];
+  if (hostsA.length > 0 || hostsB.length > 0) {
+    fieldDiffs.push({
+      id: 'web_probed_hosts',
+      category: 'web',
+      label: 'Reachable Subdomains Inspected',
+      rfcOrSpec: 'Multi-Subdomain HTTP Surface',
+      valueA: hostsA.length > 0 ? hostsA : ['No reachable subdomains observed'],
+      valueB: hostsB.length > 0 ? hostsB : ['No reachable subdomains observed'],
+      status: compareValues(hostsA, hostsB),
     });
   }
 
@@ -1357,8 +1358,619 @@ function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomainRecord
   const rawTextDiff = computeTextDiff(normalizedRawA, normalizedRawB, domainA.domainName, domainB.domainName);
 
   return {
+    isSingleDomain: false,
     domainA: normalizedDomainA,
     domainB: normalizedDomainB,
+    fieldDiffs,
+    summary,
+    rawTextDiff,
+    computedAt: Date.now(),
+  };
+}
+
+function computeSingleDomainResult(domain: WhoisDomainRecord): WhoisDiffResult {
+  const fieldDiffs: FieldDiffItem[] = [];
+
+  // 1. ATTRIBUTION PIVOTS
+  fieldDiffs.push({
+    id: 'registrant_org',
+    category: 'attribution',
+    label: 'Registrant Organization',
+    rfcOrSpec: 'RDAP / WHOIS',
+    valueA: domain.registrantOrg || 'Redacted for Privacy / Proxy',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  const tokens = (domain.verificationTokens || []).map((t) => `${t.provider}: ${t.token}`);
+  fieldDiffs.push({
+    id: 'verification_tokens',
+    category: 'attribution',
+    label: 'Domain Verification Tokens (TXT)',
+    rfcOrSpec: 'RFC 1464 / Cloud IDP',
+    valueA: tokens.length > 0 ? tokens : ['No third-party verification tokens detected'],
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  const spfIncludes = domain.spfIncludes || [];
+  fieldDiffs.push({
+    id: 'spf_relays',
+    category: 'attribution',
+    label: 'Authorized Mail Relays (SPF)',
+    rfcOrSpec: 'RFC 7208 SPF',
+    valueA: spfIncludes.length > 0 ? spfIncludes : [domain.spfRecord || 'No SPF record'],
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  const spfIps = domain.spfIpMechanisms || [];
+  if (spfIps.length > 0) {
+    fieldDiffs.push({
+      id: 'spf_ip_leaks',
+      category: 'attribution',
+      label: 'SPF Origin IPs & Direct Mechanisms',
+      rfcOrSpec: 'RFC 7208 ip4/ip6/redirect',
+      valueA: spfIps,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.dmarcRua || domain.dmarcRuf || domain.dmarcPolicy) {
+    const parts: string[] = [];
+    if (domain.dmarcPolicy) parts.push(`p=${domain.dmarcPolicy}`);
+    if (domain.dmarcRua) parts.push(`rua=${domain.dmarcRua}`);
+    if (domain.dmarcRuf) parts.push(`ruf=${domain.dmarcRuf}`);
+    fieldDiffs.push({
+      id: 'dmarc_policy',
+      category: 'attribution',
+      label: 'DMARC Policy & Aggregate / Forensic URIs',
+      rfcOrSpec: 'RFC 7489 DMARC (rua / ruf)',
+      valueA: parts.join(' | ') || 'No DMARC Record',
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  const dkim = domain.dkimSelectors || [];
+  if (dkim.length > 0) {
+    fieldDiffs.push({
+      id: 'dkim_selectors',
+      category: 'attribution',
+      label: 'DKIM Selectors & CNAME Tenants',
+      rfcOrSpec: 'RFC 6376 _domainkey',
+      valueA: dkim,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.soaRname) {
+    fieldDiffs.push({
+      id: 'soa_rname',
+      category: 'attribution',
+      label: 'SOA Hostmaster Contact (RNAME)',
+      rfcOrSpec: 'RFC 1035 SOA RNAME',
+      valueA: domain.soaRname,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  const analytics = domain.analyticsIds || [];
+  if (analytics.length > 0) {
+    fieldDiffs.push({
+      id: 'analytics_ids',
+      category: 'attribution',
+      label: 'Analytics & Ad Tracking IDs',
+      rfcOrSpec: 'HTML / First-Party JS Static Scan',
+      valueA: analytics,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  const htmlTokens = (domain.htmlVerificationTokens || []).map((t) => `${t.provider}: ${t.token}`);
+  if (htmlTokens.length > 0) {
+    fieldDiffs.push({
+      id: 'html_verification_tokens',
+      category: 'attribution',
+      label: 'HTML Meta Verification Tokens',
+      rfcOrSpec: 'HTML <meta> Ownership Tags',
+      valueA: htmlTokens,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  const copyrightNotices = domain.footerCopyrights || [];
+  if (copyrightNotices.length > 0) {
+    fieldDiffs.push({
+      id: 'footer_copyright',
+      category: 'attribution',
+      label: 'Footer Copyright Notice & Holder',
+      rfcOrSpec: 'HTML <footer> Copyright Extraction',
+      valueA: copyrightNotices,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  fieldDiffs.push({
+    id: 'registrant_country',
+    category: 'attribution',
+    label: 'Registrant Country / State',
+    rfcOrSpec: 'ISO 3166-1 / ISO 3166-2',
+    valueA: domain.registrantCountry
+      ? `${domain.registrantCountry.toUpperCase()}${domain.registrantState ? ` (${domain.registrantState})` : ''}`
+      : 'Redacted / Not Disclosed',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  // 2. CERTIFICATES & TLS
+  fieldDiffs.push({
+    id: 'tls_subject_org',
+    category: 'certificates',
+    label: 'SSL/TLS Subject Organization',
+    rfcOrSpec: 'RFC 5280 X.509',
+    valueA: domain.tlsSubjectOrg
+      ? `${domain.tlsSubjectOrg} (${domain.tlsSubjectCn || domain.domainName})`
+      : domain.tlsSubjectCn || 'Domain Validation (DV Only)',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'tls_issuer_ca',
+    category: 'certificates',
+    label: 'SSL/TLS Certificate Authority',
+    rfcOrSpec: 'RFC 5280 CA / CT Log Hierarchy',
+    valueA: domain.tlsIssuerOrg
+      ? `${domain.tlsIssuerOrg}${domain.tlsIssuerCn ? ` [${domain.tlsIssuerCn}]` : ''}`
+      : 'Probe Unresolved',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  if (domain.tlsProtocol) {
+    fieldDiffs.push({
+      id: 'tls_protocol',
+      category: 'certificates',
+      label: 'Negotiated TLS Protocol & Cipher',
+      rfcOrSpec: 'RFC 8446 TLS 1.3',
+      valueA: `${domain.tlsProtocol} (${domain.tlsCipher || 'Default Cipher'})`,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.tlsValidityNotAfter) {
+    fieldDiffs.push({
+      id: 'tls_validity',
+      category: 'certificates',
+      label: 'X.509 Certificate Validity Window',
+      rfcOrSpec: 'RFC 5280 NotBefore / NotAfter',
+      valueA: `${domain.tlsValidityNotBefore || '?'} -> ${domain.tlsValidityNotAfter}`,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  fieldDiffs.push({
+    id: 'crt_subdomains_count',
+    category: 'certificates',
+    label: 'Certificate Transparency Subdomains',
+    rfcOrSpec: 'RFC 6962 CT Logs',
+    valueA: `${domain.crtSubdomainsCount?.toLocaleString() || 0} subdomains discovered${domain.crtWildcardFound ? ' [Wildcard *. cert]' : ''}`,
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  // 3. NETWORK & BGP
+  fieldDiffs.push({
+    id: 'bgp_asn',
+    category: 'network',
+    label: 'Autonomous System (BGP ASN)',
+    rfcOrSpec: 'RFC 1930 / Team Cymru BGP',
+    valueA: domain.asn ? `${domain.asn}${domain.asnName ? ` (${domain.asnName})` : ''}` : 'Unrouted / Private',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'subnet_24',
+    category: 'network',
+    label: 'IPv4 /24 Subnet Allocation',
+    rfcOrSpec: 'CIDR Routing Prefix',
+    valueA: domain.subnet24 || 'None resolved',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'a_records',
+    category: 'network',
+    label: 'IPv4 Addresses (A Records)',
+    rfcOrSpec: 'RFC 1035 A',
+    valueA: domain.aRecords?.length ? domain.aRecords : ['None resolved'],
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  const ptrs = domain.ptrRecords || [];
+  if (ptrs.length > 0) {
+    fieldDiffs.push({
+      id: 'ptr_records',
+      category: 'network',
+      label: 'Reverse DNS (PTR Hostnames)',
+      rfcOrSpec: 'RFC 1035 / RFC 3596 PTR',
+      valueA: ptrs,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  const pdnsDisp = domain.passiveDnsDisplay || [];
+  if (pdnsDisp.length > 0) {
+    fieldDiffs.push({
+      id: 'passive_dns_records',
+      category: 'network',
+      label: 'Passive DNS Historical Resolutions',
+      rfcOrSpec: 'PDNS / Historical IP Footprint',
+      valueA: pdnsDisp,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.httpWebServer) {
+    fieldDiffs.push({
+      id: 'web_server',
+      category: 'network',
+      label: 'Edge Web Server Technology',
+      rfcOrSpec: 'RFC 9110 HTTP Server Header',
+      valueA: `${domain.httpWebServer} (HTTP ${domain.httpStatusCode || 200})`,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  // 3B. WEB RECON & PASSIVE DNS
+  const formatWebStatus = (d: WhoisDomainRecord) => {
+    if (d.webReconMode === 'cors-blocked') return 'Blocked by Target CORS Policy (Use backend server for direct inspection)';
+    if (d.webReconMode === 'unreachable') return 'Unreachable over HTTP/HTTPS';
+    if (!d.httpStatusCode && !d.webFinalUrl) return 'Not available';
+    const scriptsNote = d.inspectedScriptsCount ? ` · ${d.inspectedScriptsCount} first-party JS scanned (static text only)` : '';
+    const subNote = d.webReconProbedHostsCount
+      ? ` · ${d.webReconReachableHosts?.length || 0}/${d.webReconProbedHostsCount} hosts reachable`
+      : '';
+    return `HTTP ${d.httpStatusCode || '?'} · ${d.webFinalUrl || `https://${d.domainName}`} [${d.webReconMode || 'direct'}]${subNote}${scriptsNote}`;
+  };
+
+  if (domain.webReconMode) {
+    fieldDiffs.push({
+      id: 'web_recon_status',
+      category: 'web',
+      label: 'HTTP Probe & Resource Access Mode',
+      rfcOrSpec: 'RFC 9110 / Multi-Subdomain Static Fetch',
+      valueA: formatWebStatus(domain),
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.webReconReachableHosts && domain.webReconReachableHosts.length > 0) {
+    fieldDiffs.push({
+      id: 'web_probed_hosts',
+      category: 'web',
+      label: 'Reachable Subdomains Inspected',
+      rfcOrSpec: 'Multi-Subdomain HTTP Surface',
+      valueA: domain.webReconReachableHosts,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.httpHeaderSummary && domain.httpHeaderSummary.length > 0) {
+    fieldDiffs.push({
+      id: 'http_headers',
+      category: 'web',
+      label: 'Sanitized HTTP Response Headers',
+      rfcOrSpec: 'RFC 9110 / Security Headers',
+      valueA: domain.httpHeaderSummary,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.cspExternalDomains && domain.cspExternalDomains.length > 0) {
+    fieldDiffs.push({
+      id: 'csp_external_domains',
+      category: 'web',
+      label: 'CSP External Origin Whitelist',
+      rfcOrSpec: 'W3C Content-Security-Policy',
+      valueA: domain.cspExternalDomains,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  const metaItems: string[] = [];
+  if (domain.htmlTitle) metaItems.push(`Title: ${domain.htmlTitle}`);
+  if (domain.openGraphSiteName) metaItems.push(`OG Site Name: ${domain.openGraphSiteName}`);
+  if (domain.htmlGenerator) metaItems.push(`Generator: ${domain.htmlGenerator}`);
+  if (domain.htmlAuthor) metaItems.push(`Author: ${domain.htmlAuthor}`);
+  if (domain.twitterSite) metaItems.push(`Twitter Site: ${domain.twitterSite}`);
+  if (domain.canonicalUrl) metaItems.push(`Canonical: ${domain.canonicalUrl}`);
+  if (domain.htmlRobots) metaItems.push(`Robots: ${domain.htmlRobots}`);
+  if (domain.htmlDescription) metaItems.push(`Description: ${domain.htmlDescription}`);
+  if (metaItems.length > 0) {
+    fieldDiffs.push({
+      id: 'html_metadata',
+      category: 'web',
+      label: 'HTML Metadata & Canonical Identity',
+      rfcOrSpec: 'HTML5 <meta> / OpenGraph',
+      valueA: metaItems,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  const domItems = [...(domain.domMarkers || []), ...(domain.domStats ? [`Stats: ${domain.domStats}`] : [])];
+  if (domItems.length > 0) {
+    fieldDiffs.push({
+      id: 'dom_inspection',
+      category: 'web',
+      label: 'DOM Structure & Framework Mounts',
+      rfcOrSpec: 'Inert DOMParser Inspection',
+      valueA: domItems,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.technologies && domain.technologies.length > 0) {
+    fieldDiffs.push({
+      id: 'technologies',
+      category: 'web',
+      label: 'Web Technology Fingerprints',
+      rfcOrSpec: 'Headers / DOM / Asset Signatures',
+      valueA: domain.technologies,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.scriptUrls && domain.scriptUrls.length > 0) {
+    fieldDiffs.push({
+      id: 'script_urls',
+      category: 'web',
+      label: 'Collected Script URLs (<script src>)',
+      rfcOrSpec: 'Static HTML Tag Enumeration',
+      valueA: domain.scriptUrls,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.resourceSummary && domain.resourceSummary.length > 0) {
+    fieldDiffs.push({
+      id: 'resource_enumeration',
+      category: 'web',
+      label: 'Enumerated Resources (CSS / Icons / Media)',
+      rfcOrSpec: 'Static HTML & CSS Asset URLs',
+      valueA: domain.resourceSummary,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.externalDomains && domain.externalDomains.length > 0) {
+    fieldDiffs.push({
+      id: 'external_domains',
+      category: 'web',
+      label: 'Discovered External Third-Party Domains',
+      rfcOrSpec: 'Outbound Links, Assets & CSP',
+      valueA: domain.externalDomains,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  // 4. DNS & MAIL INFRASTRUCTURE
+  const dnsProv = domain.dnsProvider || inferDnsProvider(domain.nameservers);
+  fieldDiffs.push({
+    id: 'dns_provider',
+    category: 'infrastructure',
+    label: 'Managed DNS Provider',
+    rfcOrSpec: 'Inferred via NS Cluster',
+    valueA: dnsProv,
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'nameservers',
+    category: 'infrastructure',
+    label: 'Authoritative Nameservers',
+    rfcOrSpec: 'RFC 1035 NS',
+    valueA: domain.nameservers.length > 0 ? domain.nameservers : ['None listed'],
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  if (domain.soaMname) {
+    fieldDiffs.push({
+      id: 'soa_mname',
+      category: 'infrastructure',
+      label: 'SOA Primary Master (MNAME)',
+      rfcOrSpec: 'RFC 1035 SOA MNAME',
+      valueA: `${domain.soaMname}${domain.soaSerial ? ` (serial ${domain.soaSerial})` : ''}`,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  fieldDiffs.push({
+    id: 'mail_provider',
+    category: 'infrastructure',
+    label: 'Enterprise Mail Solution',
+    rfcOrSpec: 'RFC 5321 MX Exchange',
+    valueA: domain.mailProvider || 'No MX Records',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'dnssec',
+    category: 'security',
+    label: 'DNSSEC Cryptographic Signing',
+    rfcOrSpec: 'RFC 4033 / 4034',
+    valueA: domain.dnssec.toUpperCase(),
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  const keys = [
+    ...(domain.dsRecords || []).map((d) => `DS: ${d}`),
+    ...(domain.dnskeyRecords || []).map((k) => `DNSKEY: ${k}`),
+  ];
+  if (keys.length > 0) {
+    fieldDiffs.push({
+      id: 'dnssec_keys',
+      category: 'security',
+      label: 'DNSSEC DS & DNSKEY Material',
+      rfcOrSpec: 'RFC 4034 DS / DNSKEY',
+      valueA: keys,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  if (domain.caaRecords && domain.caaRecords.length > 0) {
+    fieldDiffs.push({
+      id: 'caa_records',
+      category: 'security',
+      label: 'CAA Certificate Policies & IODEF',
+      rfcOrSpec: 'RFC 8659 CAA',
+      valueA: domain.caaRecords,
+      valueB: undefined,
+      status: 'ONLY_A',
+    });
+  }
+
+  // 5. REGISTRAR & EPP SECURITY
+  fieldDiffs.push({
+    id: 'registrar_name',
+    category: 'registrar',
+    label: 'Sponsoring Registrar',
+    rfcOrSpec: 'ICANN RAA',
+    valueA: domain.registrar || 'Protected / Redacted',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'epp_status',
+    category: 'security',
+    label: 'EPP Domain Status Locks',
+    rfcOrSpec: 'RFC 5731 EPP',
+    valueA: domain.status.length > 0 ? domain.status : ['ok (unlocked)'],
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'abuse_email',
+    category: 'registrar',
+    label: 'Registrar Abuse Contact',
+    rfcOrSpec: 'RFC 2142',
+    valueA: domain.abuseContactEmail || 'Protected / Registry Proxy',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  // 6. LIFECYCLE & DATES
+  fieldDiffs.push({
+    id: 'domain_age',
+    category: 'lifecycle',
+    label: 'Domain Age & Inception',
+    rfcOrSpec: 'Registry Creation Date',
+    valueA: domain.domainAgeFormatted || (domain.domainAgeYears ? `${domain.domainAgeYears} years` : 'Undetermined'),
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'created_date',
+    category: 'lifecycle',
+    label: 'Registration Timestamp (UTC)',
+    rfcOrSpec: 'ISO 8601 / RDAP Events',
+    valueA: formatUtcPrecision(domain.createdDate),
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'days_until_expiration',
+    category: 'lifecycle',
+    label: 'Registry Expiration Horizon',
+    rfcOrSpec: 'Renewal Countdown',
+    valueA:
+      domain.daysUntilExpiration !== undefined
+        ? `${domain.daysUntilExpiration.toLocaleString()} days (${domain.expirationStatus?.toUpperCase()})`
+        : 'Undetermined',
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  fieldDiffs.push({
+    id: 'updated_date',
+    category: 'lifecycle',
+    label: 'Last Registry Touch / Update',
+    rfcOrSpec: 'Automated Registry Sync',
+    valueA: formatUtcPrecision(domain.updatedDate),
+    valueB: undefined,
+    status: 'ONLY_A',
+  });
+
+  const normalizedRaw = formatCanonicalJsonText(domain.rawText || '');
+  const normalizedDomain =
+    normalizedRaw === (domain.rawText || '') ? domain : { ...domain, rawText: normalizedRaw };
+
+  const rawLines = normalizedRaw.split(/\r?\n/).map((l) => l.trimEnd());
+  const rawTextDiff: TextDiffLine[] = [
+    { type: 'header', text: `--- ${domain.domainName} (WHOIS / RDAP Record)` },
+    ...rawLines.slice(0, 1999).map((line, idx) => ({
+      type: 'same' as const,
+      text: `  ${line}`,
+      lineA: idx + 1,
+    })),
+  ];
+
+  const summary: WhoisDiffSummary = {
+    totalFieldsCompared: fieldDiffs.length,
+    divergentCount: 0,
+    matchingCount: 0,
+    sharedNameserversCount: 0,
+    totalNameserversCount: domain.nameservers.length,
+    sameRegistrar: false,
+    sameDnsProvider: false,
+    sameMailProvider: false,
+    sameAsn: false,
+    sameSubnet24: false,
+    sameTlsSubjectOrg: false,
+    sharedVerificationTokensCount: 0,
+    linkages: [],
+    overallAttributionVerdict: 'DISTINCT_INDEPENDENT_ENTITIES',
+  };
+
+  return {
+    isSingleDomain: true,
+    domainA: normalizedDomain,
+    domainB: undefined,
     fieldDiffs,
     summary,
     rawTextDiff,
@@ -1652,6 +2264,8 @@ async function lookupClientIpAsn(
 async function fetchClientCtSubdomains(rootDomain: string): Promise<{
   crtSubdomainsCount: number;
   crtSubdomainsSample: string[];
+  allSubdomains: string[];
+  hackerTargetRecords: Array<{ host: string; ip: string }>;
   crtWildcardFound: boolean;
   tlsIssuerOrg?: string;
   tlsIssuerCn?: string;
@@ -1663,6 +2277,7 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
     .trim()
     .replace(/^\.+|\.+$/g, '');
   const subs = new Set<string>();
+  const hackerTargetRecords: Array<{ host: string; ip: string }> = [];
   let crtWildcardFound = false;
   let tlsIssuerOrg: string | undefined;
   let tlsIssuerCn: string | undefined;
@@ -1672,7 +2287,7 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
   const queryCertspotter = async () => {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5500);
+      const timer = setTimeout(() => controller.abort(), 5000);
       const res = await fetch(
         `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(cleanApex)}&include_subdomains=true&expand=dns_names&expand=issuer`,
         { headers: { Accept: 'application/json' }, signal: controller.signal }
@@ -1681,7 +2296,6 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
       if (res.ok) {
         const items = await res.json();
         if (Array.isArray(items)) {
-          // Prefer non-revoked latest cert for TLS issuer/validity metadata
           const preferred = items.find((it: any) => it && !it.revoked && it.issuer) || items[0];
           if (preferred) {
             const issuerName = String(preferred.issuer?.name || '');
@@ -1712,7 +2326,7 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
   const queryHackerTarget = async () => {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
+      const timer = setTimeout(() => controller.abort(), 4500);
       const res = await fetch(
         `https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(cleanApex)}`,
         { signal: controller.signal }
@@ -1721,10 +2335,15 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
       if (res.ok) {
         const text = await res.text();
         if (text && !text.includes('error') && !text.includes('API count exceeded')) {
-          for (const line of text.split('\n')) {
-            const host = line.split(',')[0]?.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+          for (const line of text.split('\n').slice(0, 500)) {
+            const [hostRaw, ipRaw] = line.split(',');
+            const host = hostRaw?.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+            const ip = ipRaw?.trim();
             if (host && (host === cleanApex || host.endsWith(`.${cleanApex}`))) {
               subs.add(host);
+              if (ip) {
+                hackerTargetRecords.push({ host, ip });
+              }
             }
           }
         }
@@ -1737,6 +2356,8 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
   return {
     crtSubdomainsCount: sorted.length,
     crtSubdomainsSample: sorted.slice(0, 120),
+    allSubdomains: sorted,
+    hackerTargetRecords,
     crtWildcardFound,
     tlsIssuerOrg,
     tlsIssuerCn,
@@ -1745,14 +2366,27 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
   };
 }
 
-async function fetchClientPassiveDns(cleanDomain: string, rootDomain: string): Promise<{
+async function fetchClientPassiveDns(
+  cleanDomain: string,
+  rootDomain: string,
+  discoveredSubs: string[] = [],
+  preloadedHtRecords: Array<{ host: string; ip: string }> = []
+): Promise<{
   passiveDnsDisplay: string[];
   passiveDnsIps: string[];
+  pdnsQueriedSubdomainsCount: number;
 }> {
   const ipSet = new Set<string>();
   const displaySet = new Set<string>();
 
+  for (const rec of preloadedHtRecords) {
+    if (!rec.host || !rec.ip) continue;
+    if (/^[\da-fA-F:.]+$/.test(rec.ip)) ipSet.add(rec.ip);
+    displaySet.add(`${rec.ip.includes(':') ? 'AAAA' : 'A'} | ${rec.host} -> ${rec.ip}`);
+  }
+
   const queryHackerTarget = async () => {
+    if (preloadedHtRecords.length > 0) return;
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 4500);
@@ -1764,7 +2398,7 @@ async function fetchClientPassiveDns(cleanDomain: string, rootDomain: string): P
       if (!res.ok) return;
       const text = await res.text();
       if (!text || text.includes('error') || text.includes('API count exceeded')) return;
-      for (const line of text.split('\n').slice(0, 30)) {
+      for (const line of text.split('\n').slice(0, 500)) {
         const [hostRaw, ipRaw] = line.split(',');
         const host = hostRaw?.trim().toLowerCase();
         const ip = ipRaw?.trim();
@@ -1775,12 +2409,14 @@ async function fetchClientPassiveDns(cleanDomain: string, rootDomain: string): P
     } catch {}
   };
 
-  const queryRipeDnsChain = async () => {
+  const pdnsTargets = prioritizeSubdomainsForRecon(cleanDomain, discoveredSubs, 10);
+
+  const queryRipeDnsChainForHost = async (targetHost: string) => {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4500);
+      const timer = setTimeout(() => controller.abort(), 3200);
       const res = await fetch(
-        `https://stat.ripe.net/data/dns-chain/data.json?resource=${encodeURIComponent(cleanDomain)}`,
+        `https://stat.ripe.net/data/dns-chain/data.json?resource=${encodeURIComponent(targetHost)}`,
         { headers: { Accept: 'application/json' }, signal: controller.signal }
       );
       clearTimeout(timer);
@@ -1801,130 +2437,135 @@ async function fetchClientPassiveDns(cleanDomain: string, rootDomain: string): P
     } catch {}
   };
 
-  await Promise.all([queryHackerTarget(), queryRipeDnsChain()]);
+  const queryRipeBatched = async () => {
+    const concurrency = 5;
+    let idx = 0;
+    const workers = Array.from({ length: Math.min(concurrency, pdnsTargets.length) }, async () => {
+      while (idx < pdnsTargets.length) {
+        const host = pdnsTargets[idx++];
+        await queryRipeDnsChainForHost(host);
+      }
+    });
+    await Promise.all(workers);
+  };
+
+  await Promise.all([queryHackerTarget(), queryRipeBatched()]);
 
   return {
-    passiveDnsDisplay: Array.from(displaySet).sort().slice(0, 40),
+    passiveDnsDisplay: Array.from(displaySet).sort().slice(0, 250),
     passiveDnsIps: Array.from(ipSet).sort(),
+    pdnsQueriedSubdomainsCount: pdnsTargets.length,
   };
 }
 
 /**
- * Pure-browser zero-execution web reconnaissance when target allows CORS.
+ * Pure-browser zero-execution web reconnaissance across discovered subdomains when targets allow CORS.
  * Strictly reads bounded UTF-8 text and parses HTML in detached inert DOMParser;
  * NEVER executes fetched JS or injects HTML into the live DOM.
  */
-async function probeClientWebPageAndHeaders(cleanDomain: string): Promise<{
-  httpWebServer?: string;
-  httpStatusCode?: number;
-  httpHeaderSummary?: string[];
-  cspExternalDomains?: string[];
-  webReconMode: 'browser-cors' | 'cors-blocked';
-  webFinalUrl?: string;
-  inspectedScriptsCount?: number;
-  htmlTitle?: string;
-  htmlDescription?: string;
-  htmlGenerator?: string;
-  htmlAuthor?: string;
-  htmlRobots?: string;
-  canonicalUrl?: string;
-  openGraphSiteName?: string;
-  twitterSite?: string;
-  htmlVerificationTokens?: Array<{ provider: string; token: string; raw: string }>;
-  domMarkers?: string[];
-  domStats?: string;
-  scriptUrls?: string[];
-  resourceSummary?: string[];
-  analyticsIds?: string[];
-  footerCopyrights?: string[];
-  copyrightEntities?: string[];
-  technologies?: string[];
-  externalDomains?: string[];
-}> {
-  const targetUrl = `https://${cleanDomain}`;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3800);
-    const res = await fetch(targetUrl, {
-      method: 'GET',
-      mode: 'cors',
-      credentials: 'omit',
-      headers: { Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' },
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
+async function probeClientWebPageAndHeaders(cleanDomain: string, discoveredSubs: string[] = []) {
+  const candidates = prioritizeSubdomainsForRecon(cleanDomain, discoveredSubs, 8);
+  const seenFinalUrls = new Set<string>();
+  const entries: SubdomainWebProbeEntry[] = [];
+  let totalScriptFetches = 0;
+  const deadline = Date.now() + 7000;
 
-    const sanitizedHeaders = sanitizeHttpHeaders(res.headers);
-    const finalUrl = res.url || targetUrl;
-    const htmlText = await readBoundedResponseText(res, MAX_HTML_RECON_BYTES);
-    const recon = analyzeHtmlRecon(htmlText, finalUrl, sanitizedHeaders, cleanDomain);
+  const probeHost = async (host: string) => {
+    if (Date.now() > deadline) return;
+    const targetUrl = `https://${host}`;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2800);
+      const res = await fetch(targetUrl, {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+        headers: { Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
 
-    // Optional bounded plain-text scan of up to 2 CORS-allowed first-party scripts (NEVER executed)
-    const analyticsSet = new Set<string>(recon.analyticsIds);
-    const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, cleanDomain, 2);
-    let inspectedScriptsCount = 0;
+      const sanitizedHeaders = sanitizeHttpHeaders(res.headers);
+      const finalUrl = res.url || targetUrl;
+      const serverHeader = sanitizedHeaders['server'] || undefined;
 
-    if (candidateScripts.length > 0) {
-      const scriptTexts = await Promise.allSettled(
-        candidateScripts.map(async (sUrl) => {
-          const sc = new AbortController();
-          const st = setTimeout(() => sc.abort(), 2200);
-          try {
-            const sr = await fetch(sUrl, {
-              method: 'GET',
-              mode: 'cors',
-              credentials: 'omit',
-              signal: sc.signal,
-            });
-            clearTimeout(st);
-            if (!sr.ok) return null;
-            return await readBoundedResponseText(sr, MAX_SCRIPT_TEXT_BYTES);
-          } catch {
-            clearTimeout(st);
-            return null;
+      if (seenFinalUrls.has(finalUrl)) {
+        entries.push({
+          host,
+          httpWebServer: serverHeader,
+          httpStatusCode: res.status,
+          webFinalUrl: finalUrl,
+        });
+        try {
+          await res.body?.cancel();
+        } catch {}
+        return;
+      }
+      seenFinalUrls.add(finalUrl);
+
+      const htmlText = await readBoundedResponseText(res, MAX_HTML_RECON_BYTES);
+      const recon = analyzeHtmlRecon(htmlText, finalUrl, sanitizedHeaders, host);
+
+      let inspectedScriptsCount = 0;
+      if (totalScriptFetches < 6 && Date.now() < deadline) {
+        const remainingScripts = Math.min(2, 6 - totalScriptFetches);
+        const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, host, remainingScripts);
+        totalScriptFetches += candidateScripts.length;
+
+        if (candidateScripts.length > 0) {
+          const scriptTexts = await Promise.allSettled(
+            candidateScripts.map(async (sUrl) => {
+              const sc = new AbortController();
+              const st = setTimeout(() => sc.abort(), 2000);
+              try {
+                const sr = await fetch(sUrl, {
+                  method: 'GET',
+                  mode: 'cors',
+                  credentials: 'omit',
+                  signal: sc.signal,
+                });
+                clearTimeout(st);
+                if (!sr.ok) return null;
+                return await readBoundedResponseText(sr, MAX_SCRIPT_TEXT_BYTES);
+              } catch {
+                clearTimeout(st);
+                return null;
+              }
+            })
+          );
+          const analyticsSet = new Set<string>(recon.analyticsIds);
+          for (const r of scriptTexts) {
+            if (r.status === 'fulfilled' && r.value) {
+              inspectedScriptsCount++;
+              extractAnalyticsIdsFromText(r.value).forEach((id) => analyticsSet.add(id));
+            }
           }
-        })
-      );
-      for (const r of scriptTexts) {
-        if (r.status === 'fulfilled' && r.value) {
-          inspectedScriptsCount++;
-          extractAnalyticsIdsFromText(r.value).forEach((id) => analyticsSet.add(id));
+          recon.analyticsIds = Array.from(analyticsSet).sort();
         }
       }
-    }
 
-    return {
-      httpWebServer: sanitizedHeaders['server'] || undefined,
-      httpStatusCode: res.status,
-      httpHeaderSummary: recon.httpHeaderSummary,
-      cspExternalDomains: recon.cspExternalDomains,
-      webReconMode: 'browser-cors',
-      webFinalUrl: finalUrl,
-      inspectedScriptsCount,
-      htmlTitle: recon.htmlTitle,
-      htmlDescription: recon.htmlDescription,
-      htmlGenerator: recon.htmlGenerator,
-      htmlAuthor: recon.htmlAuthor,
-      htmlRobots: recon.htmlRobots,
-      canonicalUrl: recon.canonicalUrl,
-      openGraphSiteName: recon.openGraphSiteName,
-      twitterSite: recon.twitterSite,
-      htmlVerificationTokens: recon.htmlVerificationTokens,
-      domMarkers: recon.domMarkers,
-      domStats: recon.domStats,
-      scriptUrls: recon.scriptUrls,
-      resourceSummary: recon.resourceSummary,
-      analyticsIds: Array.from(analyticsSet).sort(),
-      footerCopyrights: recon.footerCopyrights,
-      copyrightEntities: recon.copyrightEntities,
-      technologies: recon.technologies,
-      externalDomains: recon.externalDomains,
-    };
-  } catch {
-    return {
-      webReconMode: 'cors-blocked',
-    };
-  }
+      entries.push({
+        host,
+        httpWebServer: serverHeader,
+        httpStatusCode: res.status,
+        webFinalUrl: finalUrl,
+        inspectedScriptsCount,
+        recon,
+      });
+    } catch {}
+  };
+
+  let idx = 0;
+  const concurrency = Math.min(4, candidates.length);
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (idx < candidates.length && Date.now() < deadline) {
+      const host = candidates[idx++];
+      await probeHost(host);
+    }
+  });
+  await Promise.all(workers);
+
+  return mergeSubdomainWebRecon(cleanDomain, entries, candidates.length, 'browser-cors');
 }
 
 // Fallback Browser RDAP, DoH & OSINT Query (used on GitHub Pages static hosting or when backend is unavailable)
@@ -1985,8 +2626,8 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
     }
   };
 
-  // Run RDAP, DoH DNS, CT + Certspotter TLS, Passive DNS, and CORS-safe Web Recon concurrently
-  const [, nsRes, aRes, aaaaRes, mxRes, dsRes, ctData, pdnsData, webData] = await Promise.all([
+  // Phase 1: RDAP, DoH DNS, and CT/HackerTarget subdomain discovery
+  const [, nsRes, aRes, aaaaRes, mxRes, dsRes, ctData] = await Promise.all([
     fetchRdap(),
     queryBrowserDoh(clean, 'NS'),
     queryBrowserDoh(clean, 'A'),
@@ -1994,8 +2635,12 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
     queryBrowserDoh(clean, 'MX'),
     queryBrowserDoh(root, 'DS'),
     fetchClientCtSubdomains(root),
-    fetchClientPassiveDns(clean, root),
-    probeClientWebPageAndHeaders(clean),
+  ]);
+
+  // Phase 2: Search all discovered subdomains for Passive DNS & Web Recon
+  const [pdnsData, webData] = await Promise.all([
+    fetchClientPassiveDns(clean, root, ctData.allSubdomains, ctData.hackerTargetRecords),
+    probeClientWebPageAndHeaders(clean, ctData.allSubdomains),
   ]);
 
   if (rdapData) {
@@ -2162,6 +2807,7 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
     subnet24: asnInfo.subnet24,
     passiveDnsDisplay: pdnsData.passiveDnsDisplay,
     passiveDnsIps: pdnsData.passiveDnsIps,
+    pdnsQueriedSubdomainsCount: pdnsData.pdnsQueriedSubdomainsCount,
     tlsIssuerOrg: ctData.tlsIssuerOrg,
     tlsIssuerCn: ctData.tlsIssuerCn,
     tlsValidityNotBefore: ctData.tlsValidityNotBefore,
@@ -2180,6 +2826,8 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
     webReconMode: webData.webReconMode,
     webFinalUrl: webData.webFinalUrl,
     inspectedScriptsCount: webData.inspectedScriptsCount || 0,
+    webReconProbedHostsCount: webData.webReconProbedHostsCount,
+    webReconReachableHosts: webData.webReconReachableHosts || [],
     htmlTitle: webData.htmlTitle,
     htmlDescription: webData.htmlDescription,
     htmlGenerator: webData.htmlGenerator,
@@ -2205,13 +2853,13 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
 async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
   const clean = sanitizeDomainInput(domain);
   if (!isValidDomainFormat(clean)) {
-    throw new Error(`Invalid domain syntax: "${domain}". Please enter a valid fully qualified domain name.`);
+    throw new Error('Invalid or disallowed domain syntax. Please enter a valid public domain name.');
   }
 
   if (shouldUseBackendApi()) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12000);
+      const timeout = setTimeout(() => controller.abort(), 24000);
       const res = await fetch(`/api/whois?domain=${encodeURIComponent(clean)}`, {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
@@ -2237,22 +2885,32 @@ async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
   return enrichDomainWithBrowserDns(clientRecord);
 }
 
-export async function fetchAndCompareWhois(domainA: string, domainB: string): Promise<WhoisDiffResult> {
-  const cleanA = sanitizeDomainInput(domainA);
-  const cleanB = sanitizeDomainInput(domainB);
+export async function fetchAndCompareWhois(domainA: string, domainB?: string): Promise<WhoisDiffResult> {
+  const cleanA = sanitizeDomainInput(domainA || '');
+  const cleanB = sanitizeDomainInput(domainB || '');
 
-  if (!isValidDomainFormat(cleanA)) {
-    throw new Error(`Domain A "${domainA}" is not a valid domain name.`);
+  if (cleanA && !isValidDomainFormat(cleanA)) {
+    throw new Error('Domain A is not a valid public domain name.');
   }
-  if (!isValidDomainFormat(cleanB)) {
-    throw new Error(`Domain B "${domainB}" is not a valid domain name.`);
+  if (cleanB && !isValidDomainFormat(cleanB)) {
+    throw new Error('Domain B is not a valid public domain name.');
+  }
+  if (!cleanA && !cleanB) {
+    throw new Error('At least one valid public domain name is required.');
+  }
+
+  // Single-domain OSINT reconnaissance mode when only one domain is provided
+  if (!cleanA || !cleanB) {
+    const singleDomain = cleanA || cleanB;
+    const record = await fetchDomainWhois(singleDomain);
+    return computeSingleDomainResult(record);
   }
 
   // Try server-side consolidated diff endpoint when backend is available, then enrich with pure browser-JS DoH lookups
   if (shouldUseBackendApi()) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 18000);
+      const timeout = setTimeout(() => controller.abort(), 30000);
       const res = await fetch(`/api/whois-diff?domainA=${encodeURIComponent(cleanA)}&domainB=${encodeURIComponent(cleanB)}`, {
         signal: controller.signal,
         headers: { Accept: 'application/json' },

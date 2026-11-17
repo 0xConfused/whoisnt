@@ -19,6 +19,7 @@ interface SideBySideRow {
 
 export const WhoisRawDiffView: React.FC<WhoisRawDiffViewProps> = ({ diff }) => {
   const { domainA, domainB, rawTextDiff } = diff;
+  const isSingle = Boolean(diff.isSingleDomain || !domainB);
   const [viewMode, setViewMode] = useState<'unified' | 'sideBySide'>('unified');
   const [isScrollLocked, setIsScrollLocked] = useState<boolean>(true);
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
@@ -148,44 +149,55 @@ export const WhoisRawDiffView: React.FC<WhoisRawDiffViewProps> = ({ diff }) => {
       {/* Minimal Toolbar: Stats, View Mode Toggle & Copy */}
       <div className="px-4 py-2.5 bg-[#141414] flex flex-wrap items-center justify-between gap-3 border-b border-[#383838] font-mono">
         <div className="flex flex-wrap items-center gap-3 text-[10px] text-[#8c8c8c]">
-          <span className="text-[#c30800] font-bold">-{delCount} deletions</span>
-          <span className="text-[#c300bb] font-bold">+{addCount} additions</span>
-          <span>{sameCount} identical</span>
+          {isSingle ? (
+            <>
+              <span className="text-[#c30800] font-bold">{domainA.domainName}</span>
+              <span>{sameCount} lines</span>
+            </>
+          ) : (
+            <>
+              <span className="text-[#c30800] font-bold">-{delCount} deletions</span>
+              <span className="text-[#c300bb] font-bold">+{addCount} additions</span>
+              <span>{sameCount} identical</span>
+            </>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div
-            role="group"
-            aria-label="Raw diff view mode"
-            className="inline-flex items-center bg-[#0d0d0d] border border-[#383838] rounded-none p-0.5 gap-0.5"
-          >
-            <button
-              type="button"
-              onClick={() => setViewMode('unified')}
-              className={`flex items-center gap-1 px-2 py-0.5 text-[10px] rounded-none border font-mono uppercase tracking-wider cursor-pointer font-semibold transition-colors ${
-                viewMode === 'unified'
-                  ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
-                  : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
-              }`}
+          {!isSingle && (
+            <div
+              role="group"
+              aria-label="Raw diff view mode"
+              className="inline-flex items-center bg-[#0d0d0d] border border-[#383838] rounded-none p-0.5 gap-0.5"
             >
-              <AlignLeft className="w-3 h-3 text-[#c30800]" />
-              <span>Unified</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setViewMode('sideBySide')}
-              className={`flex items-center gap-1 px-2 py-0.5 text-[10px] rounded-none border font-mono uppercase tracking-wider cursor-pointer font-semibold transition-colors ${
-                viewMode === 'sideBySide'
-                  ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
-                  : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
-              }`}
-            >
-              <Split className="w-3 h-3 text-[#c30800]" />
-              <span>Side-by-Side</span>
-            </button>
-          </div>
+              <button
+                type="button"
+                onClick={() => setViewMode('unified')}
+                className={`flex items-center gap-1 px-2 py-0.5 text-[10px] rounded-none border font-mono uppercase tracking-wider cursor-pointer font-semibold transition-colors ${
+                  viewMode === 'unified'
+                    ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
+                    : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
+                }`}
+              >
+                <AlignLeft className="w-3 h-3 text-[#c30800]" />
+                <span>Unified</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('sideBySide')}
+                className={`flex items-center gap-1 px-2 py-0.5 text-[10px] rounded-none border font-mono uppercase tracking-wider cursor-pointer font-semibold transition-colors ${
+                  viewMode === 'sideBySide'
+                    ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
+                    : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
+                }`}
+              >
+                <Split className="w-3 h-3 text-[#c30800]" />
+                <span>Side-by-Side</span>
+              </button>
+            </div>
+          )}
 
-          {viewMode === 'sideBySide' ? (
+          {!isSingle && viewMode === 'sideBySide' ? (
             <button
               type="button"
               onClick={toggleScrollLock}
@@ -207,7 +219,7 @@ export const WhoisRawDiffView: React.FC<WhoisRawDiffViewProps> = ({ diff }) => {
           ) : (
             <button
               type="button"
-              onClick={() => handleCopy(fullUnifiedText, 'unified')}
+              onClick={() => handleCopy(isSingle ? (domainA.rawText || fullUnifiedText) : fullUnifiedText, 'unified')}
               className="flex items-center gap-1 px-2 py-1 text-[10px] font-mono uppercase tracking-wider border border-[#383838] bg-[#0d0d0d] hover:bg-[#262626] text-[#8c8c8c] hover:text-[#f0f0f0] transition-colors rounded-none cursor-pointer"
             >
               {copiedSection === 'unified' ? (
@@ -227,7 +239,7 @@ export const WhoisRawDiffView: React.FC<WhoisRawDiffViewProps> = ({ diff }) => {
       </div>
 
       {/* Content Area */}
-      {viewMode === 'unified' ? (
+      {(isSingle || viewMode === 'unified') ? (
         <div className="p-4 bg-[#0d0d0d] overflow-x-auto max-h-[600px] overflow-y-auto custom-scrollbar font-mono text-xs">
           {rawTextDiff.length === 0 ? (
             <div className="text-[#737373] py-12 text-center">No raw difference recorded between records.</div>
@@ -311,6 +323,7 @@ export const WhoisRawDiffView: React.FC<WhoisRawDiffViewProps> = ({ diff }) => {
           </div>
 
           {/* Domain B Raw */}
+          {domainB && (
           <div className="p-4 flex flex-col min-w-0">
             <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#2e2e2e]">
               <div className="flex items-center gap-1.5 font-mono text-xs font-bold text-[#c300bb]">
@@ -360,6 +373,7 @@ export const WhoisRawDiffView: React.FC<WhoisRawDiffViewProps> = ({ diff }) => {
               </pre>
             )}
           </div>
+          )}
         </div>
       )}
     </div>

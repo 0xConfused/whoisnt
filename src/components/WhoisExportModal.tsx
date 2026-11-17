@@ -15,40 +15,67 @@ export const WhoisExportModal: React.FC<WhoisExportModalProps> = ({ diff, onClos
   if (!diff) return null;
 
   const { domainA, domainB, fieldDiffs, summary } = diff;
+  const isSingle = Boolean(diff.isSingleDomain || !domainB);
+  const fileSlug = isSingle
+    ? `whois-osint-${domainA.domainName}`
+    : `whois-diff-${domainA.domainName}-vs-${domainB!.domainName}`;
 
   const generateMarkdown = (): string => {
-    const lines: string[] = [
-      `# WHOIS & OSINT Delta Intelligence Report`,
-      `**Target A**: \`${domainA.domainName}\` | **Target B**: \`${domainB.domainName}\``,
-      `**Attribution Verdict**: \`${summary.overallAttributionVerdict.replace(/_/g, ' ')}\``,
-      `**Generated**: ${new Date(diff.computedAt).toUTCString()}`,
-      `**License**: AGPL-3.0-or-later (0xCONFUSED ./whoisnt)`,
-      ``,
-      `## OSINT Executive Summary`,
-      `- **Total OSINT Attributes Compared**: ${summary.totalFieldsCompared}`,
-      `- **Divergent Indicators**: ${summary.divergentCount}`,
-      `- **Matching Indicators**: ${summary.matchingCount}`,
-      `- **Lifecycle Inception Delta**: ${summary.ageDeltaFormatted || 'Comparable'}`,
-      `- **Expiration Horizon Delta**: ${summary.expirationDeltaFormatted || 'Comparable'}`,
-      `- **BGP Network Alignment**: ${summary.sameAsn ? 'Shared Autonomous System' : 'Separate ASNs'}`,
-      `- **Subnet /24 Co-location**: ${summary.sameSubnet24 ? 'Co-located in same /24' : 'Distinct Subnets'}`,
-      `- **Shared Nameservers**: ${summary.sharedNameserversCount} / ${summary.totalNameserversCount}`,
-      `- **Registrar Alignment**: ${summary.sameRegistrar ? 'Same Registrar' : 'Different Registrars'}`,
-      `- **DNS Provider Alignment**: ${summary.sameDnsProvider ? 'Shared DNS Provider' : 'Different Providers'}`,
-      `- **Mail Provider Alignment**: ${summary.sameMailProvider ? 'Identical Mail Solution' : 'Different Providers'}`,
-      `- **Discovered Shared Linkages**: ${summary.linkages.length > 0 ? summary.linkages.map((l) => l.title).join('; ') : 'None'}`,
-      ``,
-      `## Structured Comparison Matrix`,
-      `| Indicator | Category | Status | ${domainA.domainName} [A] | ${domainB.domainName} [B] | Specification / Notes |`,
-      `| :--- | :--- | :---: | :--- | :--- | :--- |`,
-    ];
+    const lines: string[] = isSingle
+      ? [
+          `# WHOIS & OSINT Intelligence Report`,
+          `**Target**: \`${domainA.domainName}\``,
+          `**Generated**: ${new Date(diff.computedAt).toUTCString()}`,
+          `**License**: AGPL-3.0-or-later (0xCONFUSED ./whoisnt)`,
+          ``,
+          `## OSINT Summary`,
+          `- **Total OSINT Attributes**: ${fieldDiffs.length}`,
+          `- **Registrar**: ${domainA.registrar || 'Protected / Redacted'}`,
+          `- **DNS Provider**: ${domainA.dnsProvider || 'Undetermined'}`,
+          `- **BGP ASN**: ${domainA.asn ? `${domainA.asn}${domainA.asnName ? ` (${domainA.asnName})` : ''}` : 'Unrouted / Private'}`,
+          ``,
+          `## OSINT Attribute Matrix`,
+          `| Indicator | Category | ${domainA.domainName} | Specification / Notes |`,
+          `| :--- | :--- | :--- | :--- |`,
+        ]
+      : [
+          `# WHOIS & OSINT Delta Intelligence Report`,
+          `**Target A**: \`${domainA.domainName}\` | **Target B**: \`${domainB!.domainName}\``,
+          `**Attribution Verdict**: \`${summary.overallAttributionVerdict.replace(/_/g, ' ')}\``,
+          `**Generated**: ${new Date(diff.computedAt).toUTCString()}`,
+          `**License**: AGPL-3.0-or-later (0xCONFUSED ./whoisnt)`,
+          ``,
+          `## OSINT Executive Summary`,
+          `- **Total OSINT Attributes Compared**: ${summary.totalFieldsCompared}`,
+          `- **Divergent Indicators**: ${summary.divergentCount}`,
+          `- **Matching Indicators**: ${summary.matchingCount}`,
+          `- **Lifecycle Inception Delta**: ${summary.ageDeltaFormatted || 'Comparable'}`,
+          `- **Expiration Horizon Delta**: ${summary.expirationDeltaFormatted || 'Comparable'}`,
+          `- **BGP Network Alignment**: ${summary.sameAsn ? 'Shared Autonomous System' : 'Separate ASNs'}`,
+          `- **Subnet /24 Co-location**: ${summary.sameSubnet24 ? 'Co-located in same /24' : 'Distinct Subnets'}`,
+          `- **Shared Nameservers**: ${summary.sharedNameserversCount} / ${summary.totalNameserversCount}`,
+          `- **Registrar Alignment**: ${summary.sameRegistrar ? 'Same Registrar' : 'Different Registrars'}`,
+          `- **DNS Provider Alignment**: ${summary.sameDnsProvider ? 'Shared DNS Provider' : 'Different Providers'}`,
+          `- **Mail Provider Alignment**: ${summary.sameMailProvider ? 'Identical Mail Solution' : 'Different Providers'}`,
+          `- **Discovered Shared Linkages**: ${summary.linkages.length > 0 ? summary.linkages.map((l) => l.title).join('; ') : 'None'}`,
+          ``,
+          `## Structured Comparison Matrix`,
+          `| Indicator | Category | Status | ${domainA.domainName} [A] | ${domainB!.domainName} [B] | Specification / Notes |`,
+          `| :--- | :--- | :---: | :--- | :--- | :--- |`,
+        ];
 
     fieldDiffs.forEach((f) => {
       const valA = Array.isArray(f.valueA) ? f.valueA.join('; ') : String(f.valueA || 'N/A');
-      const valB = Array.isArray(f.valueB) ? f.valueB.join('; ') : String(f.valueB || 'N/A');
-      lines.push(
-        `| **${f.label}** | \`${f.category}\` | \`${f.status}\` | ${valA.replace(/\|/g, '\\|')} | ${valB.replace(/\|/g, '\\|')} | ${f.deltaSummary ? `*${f.deltaSummary}* - ` : ''}${f.rfcOrSpec || ''} |`
-      );
+      if (isSingle) {
+        lines.push(
+          `| **${f.label}** | \`${f.category}\` | ${valA.replace(/\|/g, '\\|')} | ${f.rfcOrSpec || ''} |`
+        );
+      } else {
+        const valB = Array.isArray(f.valueB) ? f.valueB.join('; ') : String(f.valueB || 'N/A');
+        lines.push(
+          `| **${f.label}** | \`${f.category}\` | \`${f.status}\` | ${valA.replace(/\|/g, '\\|')} | ${valB.replace(/\|/g, '\\|')} | ${f.deltaSummary ? `*${f.deltaSummary}* - ` : ''}${f.rfcOrSpec || ''} |`
+        );
+      }
     });
 
     lines.push(``);
@@ -60,18 +87,28 @@ export const WhoisExportModal: React.FC<WhoisExportModalProps> = ({ diff, onClos
 
   const generateCsv = (): string => {
     const escapeCsv = (str: string) => `"${str.replace(/"/g, '""')}"`;
-    const rows = [
-      ['Property', 'Category', 'Status', `${domainA.domainName} (Domain A)`, `${domainB.domainName} (Domain B)`, 'Specification', 'Delta Insight'],
-      ...fieldDiffs.map((f) => [
-        f.label,
-        f.category,
-        f.status,
-        Array.isArray(f.valueA) ? f.valueA.join('; ') : String(f.valueA || ''),
-        Array.isArray(f.valueB) ? f.valueB.join('; ') : String(f.valueB || ''),
-        f.rfcOrSpec || '',
-        f.deltaSummary || '',
-      ]),
-    ];
+    const rows = isSingle
+      ? [
+          ['Property', 'Category', domainA.domainName, 'Specification'],
+          ...fieldDiffs.map((f) => [
+            f.label,
+            f.category,
+            Array.isArray(f.valueA) ? f.valueA.join('; ') : String(f.valueA || ''),
+            f.rfcOrSpec || '',
+          ]),
+        ]
+      : [
+          ['Property', 'Category', 'Status', `${domainA.domainName} (Domain A)`, `${domainB!.domainName} (Domain B)`, 'Specification', 'Delta Insight'],
+          ...fieldDiffs.map((f) => [
+            f.label,
+            f.category,
+            f.status,
+            Array.isArray(f.valueA) ? f.valueA.join('; ') : String(f.valueA || ''),
+            Array.isArray(f.valueB) ? f.valueB.join('; ') : String(f.valueB || ''),
+            f.rfcOrSpec || '',
+            f.deltaSummary || '',
+          ]),
+        ];
 
     return rows.map((r) => r.map((c) => escapeCsv(String(c))).join(',')).join('\n');
   };
@@ -131,10 +168,14 @@ export const WhoisExportModal: React.FC<WhoisExportModalProps> = ({ diff, onClos
           <div className="bg-[#0d0d0d] border border-[#2e2e2e] p-3 text-xs font-mono text-[#8c8c8c] flex items-center justify-between">
             <div>
               <span className="text-[#f0f0f0] font-bold">{domainA.domainName}</span>
-              <span className="text-[#737373] mx-2">vs</span>
-              <span className="text-[#f0f0f0] font-bold">{domainB.domainName}</span>
+              {!isSingle && domainB && (
+                <>
+                  <span className="text-[#737373] mx-2">vs</span>
+                  <span className="text-[#f0f0f0] font-bold">{domainB.domainName}</span>
+                </>
+              )}
             </div>
-            <span>{fieldDiffs.length} attributes compared</span>
+            <span>{fieldDiffs.length} {isSingle ? 'attributes' : 'attributes compared'}</span>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -156,7 +197,7 @@ export const WhoisExportModal: React.FC<WhoisExportModalProps> = ({ diff, onClos
                   onClick={() =>
                     handleDownload(
                       generateMarkdown(),
-                      `whois-diff-${domainA.domainName}-vs-${domainB.domainName}.md`,
+                      `${fileSlug}.md`,
                       'text/markdown'
                     )
                   }
@@ -193,7 +234,7 @@ export const WhoisExportModal: React.FC<WhoisExportModalProps> = ({ diff, onClos
                   onClick={() =>
                     handleDownload(
                       JSON.stringify(diff, null, 2),
-                      `whois-diff-${domainA.domainName}-vs-${domainB.domainName}.json`,
+                      `${fileSlug}.json`,
                       'application/json'
                     )
                   }
@@ -230,7 +271,7 @@ export const WhoisExportModal: React.FC<WhoisExportModalProps> = ({ diff, onClos
                   onClick={() =>
                     handleDownload(
                       generateCsv(),
-                      `whois-diff-${domainA.domainName}-vs-${domainB.domainName}.csv`,
+                      `${fileSlug}.csv`,
                       'text/csv'
                     )
                   }

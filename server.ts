@@ -8,14 +8,17 @@ import net from 'net';
 import { createServer as createViteServer } from 'vite';
 import { canonicalizeJsonStringify } from './src/utils/jsonSort';
 import { parseFlexibleDateMs } from './src/utils/dateUtils';
+import { sanitizeDomainInput, isValidDomainFormat, extractApexDomain, prioritizeSubdomainsForRecon } from './src/utils/urlUtils';
 import {
   analyzeHtmlRecon,
   extractAnalyticsIdsFromText,
   MAX_HTML_RECON_BYTES,
   MAX_SCRIPT_TEXT_BYTES,
+  mergeSubdomainWebRecon,
   readBoundedResponseText,
   sanitizeHttpHeaders,
   selectFirstPartyScriptsForInspection,
+  type SubdomainWebProbeEntry,
 } from './src/utils/htmlRecon';
 
 const app = express();
@@ -213,7 +216,8 @@ function getUserAgent(reqOrIdentifier?: express.Request | string): string {
   } else if (reqOrIdentifier && typeof reqOrIdentifier === 'object') {
     id = extractUserIdentifier(reqOrIdentifier);
   }
-  return `Mozilla/5.0 (compatible; 0xCONFUSED./whoisnt; user: ${id})`;
+  const safeId = id.replace(/[^a-zA-Z0-9.:_-]/g, '').slice(0, 64) || '127.0.0.1';
+  return `Mozilla/5.0 (compatible; 0xCONFUSED./whoisnt; user: ${safeId})`;
 }
 
 class CircularRedirectError extends Error {
@@ -421,35 +425,6 @@ async function fetchDnsOverHttps(domain: string, type: string, userAgentOrReq?: 
   } catch {
     return [];
   }
-}
-
-const MULTI_PART_TLDS = new Set([
-  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'net.uk', 'me.uk', 'ltd.uk', 'plc.uk',
-  'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au', 'asn.au', 'id.au',
-  'co.jp', 'ne.jp', 'or.jp', 'ac.jp', 'go.jp', 'ed.jp',
-  'co.nz', 'net.nz', 'org.nz', 'govt.nz', 'ac.nz',
-  'com.br', 'net.br', 'org.br', 'gov.br', 'edu.br',
-  'com.mx', 'org.mx', 'edu.mx', 'gob.mx', 'net.mx',
-  'co.in', 'net.in', 'org.in', 'gen.in', 'firm.in', 'ind.in', 'nic.in', 'ac.in', 'edu.in', 'gov.in',
-  'com.sg', 'edu.sg', 'gov.sg', 'net.sg', 'org.sg',
-  'co.za', 'net.za', 'org.za', 'web.za', 'gov.za',
-  'com.tr', 'net.tr', 'org.tr', 'edu.tr', 'gov.tr',
-  'com.hk', 'org.hk', 'net.hk', 'edu.hk', 'gov.hk',
-  'com.tw', 'org.tw', 'net.tw', 'edu.tw', 'gov.tw',
-  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn',
-  'gc.ca', 'qc.ca', 'ab.ca', 'bc.ca', 'on.ca',
-]);
-
-function extractApexDomain(hostname: string): string {
-  const clean = hostname.toLowerCase().trim().replace(/:\d+$/, '').replace(/^\.+|\.+$/g, '');
-  const parts = clean.split('.').filter(Boolean);
-  if (parts.length <= 2) return clean;
-
-  const lastTwo = parts.slice(-2).join('.');
-  if (MULTI_PART_TLDS.has(lastTwo) && parts.length >= 3) {
-    return parts.slice(-3).join('.');
-  }
-  return parts.slice(-2).join('.');
 }
 
 let ianaBootstrapCache: any = null;
@@ -916,7 +891,11 @@ async function resolveDomainWhoisAndRdap(domain: string, userAgentOrReq?: string
 
 const crtCache = new Map<string, { data: any; timestamp: number }>();
 
-async function fetchCrtNameSubdomains(apexDomain: string, userAgentOrReq?: string | express.Request): Promise<any> {
+async function fetchCrtNameSubdomains(
+  apexDomain: string,
+  userAgentOrReq?: string | express.Request,
+  timeoutMs = 9000
+): Promise<any> {
   const cleanApex = apexDomain.toLowerCase().trim().replace(/:\d+$/, '').replace(/^\.+|\.+$/g, '');
   if (!cleanApex || isPrivateOrLocalHost(cleanApex)) {
     return {
@@ -937,7 +916,7 @@ async function fetchCrtNameSubdomains(apexDomain: string, userAgentOrReq?: strin
   const sourceUrl = `https://crt.name/v1/search?apex=${encodeURIComponent(cleanApex)}`;
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 9000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const res = await safeFetch(sourceUrl, {
       signal: controller.signal,
       headers: {
@@ -1222,41 +1201,24 @@ async function extractAttributionAndVerification(domain: string): Promise<{
   };
 }
 
-async function probeWebPageAndHeaders(domain: string, userAgent: string): Promise<{
-  httpWebServer?: string;
-  httpStatusCode?: number;
-  httpHeaderSummary?: string[];
-  cspExternalDomains?: string[];
-  webReconMode: 'server-direct' | 'unreachable';
-  webFinalUrl?: string;
-  inspectedScriptsCount?: number;
-  htmlTitle?: string;
-  htmlDescription?: string;
-  htmlGenerator?: string;
-  htmlAuthor?: string;
-  htmlRobots?: string;
-  canonicalUrl?: string;
-  openGraphSiteName?: string;
-  twitterSite?: string;
-  htmlVerificationTokens?: Array<{ provider: string; token: string; raw: string }>;
-  domMarkers?: string[];
-  domStats?: string;
-  scriptUrls?: string[];
-  resourceSummary?: string[];
-  analyticsIds?: string[];
-  footerCopyrights?: string[];
-  copyrightEntities?: string[];
-  technologies?: string[];
-  externalDomains?: string[];
-}> {
-  let res: Response | null = null;
-  let attemptUrl = `https://${domain}`;
+async function probeSingleHostWebRecon(
+  host: string,
+  userAgent: string,
+  allowHttpFallback: boolean,
+  seenFinalUrls: Set<string>,
+  scriptBudget: { remaining: number }
+): Promise<SubdomainWebProbeEntry | null> {
+  if (!isValidDomainFormat(host) || isPrivateOrLocalHost(host)) return null;
 
-  for (const scheme of ['https', 'http']) {
-    attemptUrl = `${scheme}://${domain}`;
+  let res: Response | null = null;
+  let attemptUrl = `https://${host}`;
+  const schemes = allowHttpFallback ? ['https', 'http'] : ['https'];
+
+  for (const scheme of schemes) {
+    attemptUrl = `${scheme}://${host}`;
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
+      const timeout = setTimeout(() => controller.abort(), 2400);
       const r = await safeFetch(attemptUrl, {
         method: 'GET',
         headers: {
@@ -1274,9 +1236,7 @@ async function probeWebPageAndHeaders(domain: string, userAgent: string): Promis
     }
   }
 
-  if (!res) {
-    return { webReconMode: 'unreachable' };
-  }
+  if (!res) return null;
 
   const finalUrl = ((res as any).finalUrl as string) || res.url || attemptUrl;
   const sanitizedHeaders = sanitizeHttpHeaders(res.headers);
@@ -1291,21 +1251,23 @@ async function probeWebPageAndHeaders(domain: string, userAgent: string): Promis
     contentType.includes('application/xml') ||
     contentType.includes('text/xml');
 
-  if (!isHtmlLike) {
+  const httpHeaderSummary = Object.keys(sanitizedHeaders)
+    .sort()
+    .map((k) => `${k}: ${sanitizedHeaders[k]}`);
+
+  if (!isHtmlLike || seenFinalUrls.has(finalUrl)) {
     try {
       await res.body?.cancel();
     } catch {}
-    const httpHeaderSummary = Object.keys(sanitizedHeaders)
-      .sort()
-      .map((k) => `${k}: ${sanitizedHeaders[k]}`);
     return {
+      host,
       httpWebServer: serverHeader,
       httpStatusCode: res.status,
-      httpHeaderSummary,
-      webReconMode: 'server-direct',
       webFinalUrl: finalUrl,
+      fallbackHeaders: httpHeaderSummary,
     };
   }
+  seenFinalUrls.add(finalUrl);
 
   let htmlText = '';
   try {
@@ -1314,95 +1276,172 @@ async function probeWebPageAndHeaders(domain: string, userAgent: string): Promis
     htmlText = '';
   }
 
-  const recon = analyzeHtmlRecon(htmlText, finalUrl, sanitizedHeaders, domain);
+  const recon = analyzeHtmlRecon(htmlText, finalUrl, sanitizedHeaders, host);
 
   // Bounded first-party script UTF-8 text scan (strictly non-executed, SSRF-guarded)
   const analyticsSet = new Set<string>(recon.analyticsIds);
-  const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, domain, 3);
   let inspectedScriptsCount = 0;
 
-  if (candidateScripts.length > 0) {
-    const scriptResults = await Promise.allSettled(
-      candidateScripts.map(async (scriptUrl) => {
-        const sc = new AbortController();
-        const timer = setTimeout(() => sc.abort(), 2600);
-        try {
-          const sRes = await safeFetch(scriptUrl, {
-            method: 'GET',
-            headers: {
-              'User-Agent': userAgent,
-              Accept: 'application/javascript,text/javascript,text/plain,*/*;q=0.5',
-            },
-            signal: sc.signal,
-            maxRedirects: 2,
-          });
-          clearTimeout(timer);
-          if (!sRes.ok) return null;
-          const sCt = (sRes.headers.get('content-type') || '').toLowerCase();
-          if (sCt && !sCt.includes('javascript') && !sCt.includes('text/') && !sCt.includes('ecmascript') && !sCt.includes('json')) {
-            try {
-              await sRes.body?.cancel();
-            } catch {}
+  if (scriptBudget.remaining > 0) {
+    const allowedForHost = Math.min(2, scriptBudget.remaining);
+    const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, host, allowedForHost);
+    scriptBudget.remaining = Math.max(0, scriptBudget.remaining - candidateScripts.length);
+
+    if (candidateScripts.length > 0) {
+      const scriptResults = await Promise.allSettled(
+        candidateScripts.map(async (scriptUrl) => {
+          const sc = new AbortController();
+          const timer = setTimeout(() => sc.abort(), 2000);
+          try {
+            const sRes = await safeFetch(scriptUrl, {
+              method: 'GET',
+              headers: {
+                'User-Agent': userAgent,
+                Accept: 'application/javascript,text/javascript,text/plain,*/*;q=0.5',
+              },
+              signal: sc.signal,
+              maxRedirects: 2,
+            });
+            clearTimeout(timer);
+            if (!sRes.ok) return null;
+            const sCt = (sRes.headers.get('content-type') || '').toLowerCase();
+            if (sCt && !sCt.includes('javascript') && !sCt.includes('text/') && !sCt.includes('ecmascript') && !sCt.includes('json')) {
+              try {
+                await sRes.body?.cancel();
+              } catch {}
+              return null;
+            }
+            return await readBoundedResponseText(sRes, MAX_SCRIPT_TEXT_BYTES);
+          } catch {
+            clearTimeout(timer);
             return null;
           }
-          return await readBoundedResponseText(sRes, MAX_SCRIPT_TEXT_BYTES);
-        } catch {
-          clearTimeout(timer);
-          return null;
-        }
-      })
-    );
+        })
+      );
 
-    for (const r of scriptResults) {
-      if (r.status === 'fulfilled' && r.value) {
-        inspectedScriptsCount++;
-        const scriptAnalytics = extractAnalyticsIdsFromText(r.value);
-        scriptAnalytics.forEach((id) => analyticsSet.add(id));
+      for (const r of scriptResults) {
+        if (r.status === 'fulfilled' && r.value) {
+          inspectedScriptsCount++;
+          const scriptAnalytics = extractAnalyticsIdsFromText(r.value);
+          scriptAnalytics.forEach((id) => analyticsSet.add(id));
+        }
       }
     }
   }
 
+  recon.analyticsIds = Array.from(analyticsSet).sort();
+
   return {
+    host,
     httpWebServer: serverHeader,
     httpStatusCode: res.status,
-    httpHeaderSummary: recon.httpHeaderSummary,
-    cspExternalDomains: recon.cspExternalDomains,
-    webReconMode: 'server-direct',
     webFinalUrl: finalUrl,
     inspectedScriptsCount,
-    htmlTitle: recon.htmlTitle,
-    htmlDescription: recon.htmlDescription,
-    htmlGenerator: recon.htmlGenerator,
-    htmlAuthor: recon.htmlAuthor,
-    htmlRobots: recon.htmlRobots,
-    canonicalUrl: recon.canonicalUrl,
-    openGraphSiteName: recon.openGraphSiteName,
-    twitterSite: recon.twitterSite,
-    htmlVerificationTokens: recon.htmlVerificationTokens,
-    domMarkers: recon.domMarkers,
-    domStats: recon.domStats,
-    scriptUrls: recon.scriptUrls,
-    resourceSummary: recon.resourceSummary,
-    analyticsIds: Array.from(analyticsSet).sort(),
-    footerCopyrights: recon.footerCopyrights,
-    copyrightEntities: recon.copyrightEntities,
-    technologies: recon.technologies,
-    externalDomains: recon.externalDomains,
+    recon,
   };
 }
 
-async function fetchServerPassiveDns(domain: string, rootDomain: string, userAgent: string): Promise<{
+async function probeWebPageAndHeaders(
+  domain: string,
+  userAgent: string,
+  discoveredSubdomains: string[] = []
+) {
+  const candidates = prioritizeSubdomainsForRecon(domain, discoveredSubdomains, 24).filter(
+    (h) => !isPrivateOrLocalHost(h)
+  );
+  const seenFinalUrls = new Set<string>();
+  const scriptBudget = { remaining: 10 };
+  const entries: SubdomainWebProbeEntry[] = [];
+  const deadline = Date.now() + 8500;
+
+  let idx = 0;
+  const concurrency = Math.min(8, Math.max(1, candidates.length));
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (idx < candidates.length && Date.now() < deadline) {
+      const host = candidates[idx++];
+      const allowHttpFallback = host === domain || host === `www.${domain}`;
+      const entry = await probeSingleHostWebRecon(host, userAgent, allowHttpFallback, seenFinalUrls, scriptBudget);
+      if (entry) {
+        entries.push(entry);
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  return mergeSubdomainWebRecon(domain, entries, candidates.length, 'server-direct');
+}
+
+async function fetchHackerTargetZone(
+  rootDomain: string,
+  userAgent: string
+): Promise<{ records: Array<{ host: string; ip: string }>; hosts: string[] }> {
+  const records: Array<{ host: string; ip: string }> = [];
+  const hostSet = new Set<string>();
+  if (!isValidDomainFormat(rootDomain) || isPrivateOrLocalHost(rootDomain)) {
+    return { records, hosts: [] };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const res = await safeFetch(`https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(rootDomain)}`, {
+      signal: controller.signal,
+      headers: { 'User-Agent': userAgent },
+      maxRedirects: 2,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return { records, hosts: [] };
+    const text = await res.text();
+    if (!text || text.includes('error') || text.includes('API count exceeded')) {
+      return { records, hosts: [] };
+    }
+
+    for (const line of text.split('\n').slice(0, 500)) {
+      const [hostRaw, ipRaw] = line.split(',');
+      const host = hostRaw?.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+      const ip = ipRaw?.trim();
+      if (!host || !ip) continue;
+      if (host !== rootDomain && !host.endsWith(`.${rootDomain}`)) continue;
+      if (!isValidDomainFormat(host) || isPrivateOrLocalHost(host)) continue;
+      hostSet.add(host);
+      records.push({ host, ip });
+    }
+  } catch {}
+
+  return { records, hosts: Array.from(hostSet) };
+}
+
+async function fetchServerPassiveDns(
+  domain: string,
+  rootDomain: string,
+  userAgent: string,
+  discoveredSubdomains: string[] = [],
+  preloadedHtRecords: Array<{ host: string; ip: string }> = []
+): Promise<{
   passiveDnsDisplay: string[];
   passiveDnsIps: string[];
+  pdnsQueriedSubdomainsCount: number;
 }> {
   const ipSet = new Set<string>();
   const displaySet = new Set<string>();
 
-  const queryMnemonic = async () => {
+  for (const rec of preloadedHtRecords) {
+    if (!rec.host || !rec.ip) continue;
+    if (/^[\da-fA-F:.]+$/.test(rec.ip)) ipSet.add(rec.ip);
+    displaySet.add(`${rec.ip.includes(':') ? 'AAAA' : 'A'} | ${rec.host} -> ${rec.ip}`);
+  }
+
+  const pdnsTargets = prioritizeSubdomainsForRecon(rootDomain, discoveredSubdomains, 16).filter(
+    (h) => !isPrivateOrLocalHost(h)
+  );
+  const mnemonicTargets = Array.from(new Set([rootDomain, `*.${rootDomain}`, ...pdnsTargets]));
+  const ripeTargets = pdnsTargets.slice(0, 12);
+
+  const queryMnemonicTarget = async (target: string) => {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3500);
-      const res = await safeFetch(`https://api.mnemonic.no/pdns/v3/${encodeURIComponent(domain)}?limit=25`, {
+      const timer = setTimeout(() => controller.abort(), 2500);
+      const res = await safeFetch(`https://api.mnemonic.no/pdns/v3/${encodeURIComponent(target)}?limit=40`, {
         signal: controller.signal,
         headers: { 'User-Agent': userAgent, Accept: 'application/json' },
         maxRedirects: 2,
@@ -1412,7 +1451,7 @@ async function fetchServerPassiveDns(domain: string, rootDomain: string, userAge
       const json = await res.json();
       if (!Array.isArray(json?.data)) return;
       for (const item of json.data) {
-        const q = String(item.query || domain).toLowerCase();
+        const q = String(item.query || target).toLowerCase();
         const rr = String(item.rrtype || '').toUpperCase();
         const ans = String(item.answer || '').trim();
         if (!rr || !ans) continue;
@@ -1429,36 +1468,54 @@ async function fetchServerPassiveDns(domain: string, rootDomain: string, userAge
     } catch {}
   };
 
-  const queryHackerTarget = async () => {
+  const queryRipeDnsChainTarget = async (target: string) => {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3500);
-      const res = await safeFetch(`https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(rootDomain)}`, {
+      const timer = setTimeout(() => controller.abort(), 2500);
+      const res = await safeFetch(`https://stat.ripe.net/data/dns-chain/data.json?resource=${encodeURIComponent(target)}`, {
         signal: controller.signal,
-        headers: { 'User-Agent': userAgent },
+        headers: { 'User-Agent': userAgent, Accept: 'application/json' },
         maxRedirects: 2,
       });
       clearTimeout(timer);
       if (!res.ok) return;
-      const text = await res.text();
-      if (!text || text.includes('error') || text.includes('API count exceeded')) return;
-      const lines = text.split('\n').slice(0, 30);
-      for (const line of lines) {
-        const [hostRaw, ipRaw] = line.split(',');
-        const host = hostRaw?.trim().toLowerCase();
-        const ip = ipRaw?.trim();
-        if (!host || !ip) continue;
-        if (/^[\da-fA-F:.]+$/.test(ip)) ipSet.add(ip);
-        displaySet.add(`${ip.includes(':') ? 'AAAA' : 'A'} | ${host} -> ${ip}`);
+      const json = await res.json();
+      const forwardNodes = json?.data?.forward_nodes;
+      if (forwardNodes && typeof forwardNodes === 'object') {
+        for (const [hostKey, vals] of Object.entries(forwardNodes)) {
+          if (!Array.isArray(vals)) continue;
+          for (const rawAns of vals) {
+            const ans = String(rawAns).trim();
+            if (!ans) continue;
+            if (/^[\da-fA-F:.]+$/.test(ans)) ipSet.add(ans);
+            displaySet.add(`${ans.includes(':') ? 'AAAA' : 'A'} | ${hostKey.toLowerCase()} -> ${ans}`);
+          }
+        }
       }
     } catch {}
   };
 
-  await Promise.allSettled([queryMnemonic(), queryHackerTarget()]);
+  const runBatched = async (items: string[], concurrency: number, workerFn: (item: string) => Promise<void>) => {
+    let i = 0;
+    const deadline = Date.now() + 5500;
+    const workers = Array.from({ length: Math.min(concurrency, Math.max(1, items.length)) }, async () => {
+      while (i < items.length && Date.now() < deadline) {
+        const nextItem = items[i++];
+        await workerFn(nextItem);
+      }
+    });
+    await Promise.all(workers);
+  };
+
+  await Promise.allSettled([
+    runBatched(mnemonicTargets, 6, queryMnemonicTarget),
+    runBatched(ripeTargets, 6, queryRipeDnsChainTarget),
+  ]);
 
   return {
-    passiveDnsDisplay: Array.from(displaySet).sort().slice(0, 40),
+    passiveDnsDisplay: Array.from(displaySet).sort().slice(0, 250),
     passiveDnsIps: Array.from(ipSet).sort(),
+    pdnsQueriedSubdomainsCount: pdnsTargets.length,
   };
 }
 
@@ -1501,27 +1558,61 @@ function inferMailProvider(mxRecords: string[]): string {
 async function getCrtSubdomainSummary(apexDomain: string, userAgent: string): Promise<{
   crtSubdomainsCount: number;
   crtSubdomainsSample: string[];
+  allSubdomains: string[];
   crtWildcardFound: boolean;
 }> {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4500);
-    const crtData = await fetchCrtNameSubdomains(apexDomain, userAgent);
-    clearTimeout(timeout);
+    const crtData = await fetchCrtNameSubdomains(apexDomain, userAgent, 4500);
+    let subdomains: string[] = Array.isArray(crtData?.subdomains) ? crtData.subdomains : [];
 
-    const subdomains = Array.isArray(crtData?.subdomains) ? crtData.subdomains : [];
-    const count = typeof crtData?.count === 'number' ? crtData.count : subdomains.length;
+    // Fallback to Certspotter CT API if crt.name returned no subdomains
+    if (subdomains.length === 0 && isValidDomainFormat(apexDomain) && !isPrivateOrLocalHost(apexDomain)) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3500);
+        const res = await safeFetch(
+          `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(apexDomain)}&include_subdomains=true&expand=dns_names`,
+          {
+            signal: controller.signal,
+            headers: { Accept: 'application/json', 'User-Agent': userAgent },
+            maxRedirects: 2,
+          }
+        );
+        clearTimeout(timeout);
+        if (res.ok) {
+          const items = await res.json();
+          if (Array.isArray(items)) {
+            const fallbackSet = new Set<string>();
+            for (const item of items) {
+              if (!Array.isArray(item?.dns_names)) continue;
+              for (const name of item.dns_names) {
+                const cleaned = String(name).toLowerCase().trim().replace(/^\.+|\.+$/g, '');
+                const base = cleaned.startsWith('*.') ? cleaned.slice(2) : cleaned;
+                if (base && (base === apexDomain || base.endsWith(`.${apexDomain}`))) {
+                  fallbackSet.add(cleaned);
+                }
+              }
+            }
+            subdomains = Array.from(fallbackSet).sort();
+          }
+        }
+      } catch {}
+    }
+
+    const count = typeof crtData?.count === 'number' && crtData.count > 0 ? crtData.count : subdomains.length;
     const wildcards = subdomains.filter((s: string) => s.startsWith('*.'));
 
     return {
       crtSubdomainsCount: count,
-      crtSubdomainsSample: subdomains.slice(0, 30),
+      crtSubdomainsSample: subdomains.slice(0, 80),
+      allSubdomains: subdomains,
       crtWildcardFound: wildcards.length > 0,
     };
   } catch {
     return {
       crtSubdomainsCount: 0,
       crtSubdomainsSample: [],
+      allSubdomains: [],
       crtWildcardFound: false,
     };
   }
@@ -1531,15 +1622,14 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
   const cleanDomain = rawDomain.toLowerCase().trim().replace(/:\d+$/, '').replace(/^\.+|\.+$/g, '');
   const rootDomain = extractApexDomain(cleanDomain);
 
-  // Run comprehensive OSINT probes in parallel
+  // Phase 1: WHOIS/RDAP, DNS, Attribution, TLS, and Subdomain Discovery (CT + HackerTarget)
   const [
     whoisResult,
     dnsResolutions,
     attributionResult,
     tlsResult,
-    webProbeResult,
     crtResult,
-    passiveDnsResult,
+    hackerTargetResult,
   ] = await Promise.allSettled([
     resolveDomainWhoisAndRdap(cleanDomain, userAgent),
     Promise.allSettled([
@@ -1551,9 +1641,21 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     ]),
     extractAttributionAndVerification(cleanDomain),
     inspectLiveTlsCert(cleanDomain),
-    probeWebPageAndHeaders(cleanDomain, userAgent),
     getCrtSubdomainSummary(rootDomain, userAgent),
-    fetchServerPassiveDns(cleanDomain, rootDomain, userAgent),
+    fetchHackerTargetZone(rootDomain, userAgent),
+  ]);
+
+  const crtData = crtResult.status === 'fulfilled' ? crtResult.value : null;
+  const htData = hackerTargetResult.status === 'fulfilled' ? hackerTargetResult.value : null;
+  const discoveredSubdomains = [
+    ...(crtData?.allSubdomains || []),
+    ...(htData?.hosts || []),
+  ];
+
+  // Phase 2: Search discovered subdomains for Web Recon and Passive DNS
+  const [webProbeResult, passiveDnsResult] = await Promise.allSettled([
+    probeWebPageAndHeaders(cleanDomain, userAgent, discoveredSubdomains),
+    fetchServerPassiveDns(cleanDomain, rootDomain, userAgent, discoveredSubdomains, htData?.records || []),
   ]);
 
   const whoisData = whoisResult.status === 'fulfilled' ? whoisResult.value : null;
@@ -1652,10 +1754,19 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
 
   const mailProvider = inferMailProvider(mxRecords);
   const attributionData = attributionResult.status === 'fulfilled' ? attributionResult.value : null;
-  const tlsData = tlsResult.status === 'fulfilled' ? tlsResult.value : null;
+  let tlsData = tlsResult.status === 'fulfilled' ? tlsResult.value : null;
   const webData = webProbeResult.status === 'fulfilled' ? webProbeResult.value : null;
-  const crtData = crtResult.status === 'fulfilled' ? crtResult.value : null;
   const pdnsData = passiveDnsResult.status === 'fulfilled' ? passiveDnsResult.value : null;
+
+  if (!tlsData?.tlsIssuerCn && !tlsData?.tlsSubjectCn) {
+    const fallbackTlsHost =
+      webData?.webReconReachableHosts?.find((h) => h !== cleanDomain) || `www.${rootDomain}`;
+    if (fallbackTlsHost && isValidDomainFormat(fallbackTlsHost) && !isPrivateOrLocalHost(fallbackTlsHost)) {
+      try {
+        tlsData = await inspectLiveTlsCert(fallbackTlsHost);
+      } catch {}
+    }
+  }
 
   return {
     domainName: cleanDomain,
@@ -1691,6 +1802,7 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     subnet24: asnInfo?.subnet24,
     passiveDnsDisplay: pdnsData?.passiveDnsDisplay || [],
     passiveDnsIps: pdnsData?.passiveDnsIps || [],
+    pdnsQueriedSubdomainsCount: pdnsData?.pdnsQueriedSubdomainsCount,
 
     // OSINT TLS
     tlsSubjectCn: tlsData?.tlsSubjectCn,
@@ -1726,6 +1838,8 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     webReconMode: webData?.webReconMode,
     webFinalUrl: webData?.webFinalUrl,
     inspectedScriptsCount: webData?.inspectedScriptsCount || 0,
+    webReconProbedHostsCount: webData?.webReconProbedHostsCount,
+    webReconReachableHosts: webData?.webReconReachableHosts || [],
     htmlTitle: webData?.htmlTitle,
     htmlDescription: webData?.htmlDescription,
     htmlGenerator: webData?.htmlGenerator,
@@ -1748,14 +1862,14 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
 }
 
 app.get('/api/whois', async (req, res) => {
-  const rawDomain = req.query.domain as string;
-  if (!rawDomain) {
+  const rawDomain = req.query.domain;
+  if (typeof rawDomain !== 'string' || !rawDomain.trim()) {
     return res.status(400).json({ error: 'Domain parameter is required' });
   }
 
-  let clean = rawDomain.trim().toLowerCase().replace(/^[a-zA-Z]+:\/\//, '').split('/')[0].split('?')[0].replace(/:\d+$/, '').replace(/^\.+|\.+$/g, '');
-  if (isPrivateOrLocalHost(clean)) {
-    return res.status(400).json({ error: 'Localhost and private IP lookups are disallowed.' });
+  const clean = sanitizeDomainInput(rawDomain);
+  if (!clean || !isValidDomainFormat(clean) || isPrivateOrLocalHost(clean)) {
+    return res.status(400).json({ error: 'Invalid or disallowed domain parameter. Only valid public domain names are permitted.' });
   }
 
   try {
@@ -1768,18 +1882,25 @@ app.get('/api/whois', async (req, res) => {
 });
 
 const handleWhoisDiff = async (req: express.Request, res: express.Response) => {
-  const domainA = (req.query.domainA || req.body?.domainA) as string;
-  const domainB = (req.query.domainB || req.body?.domainB) as string;
+  const domainA = req.query.domainA ?? req.body?.domainA;
+  const domainB = req.query.domainB ?? req.body?.domainB;
 
-  if (!domainA || !domainB) {
+  if (typeof domainA !== 'string' || typeof domainB !== 'string' || !domainA.trim() || !domainB.trim()) {
     return res.status(400).json({ error: 'Both domainA and domainB parameters are required' });
   }
 
-  const cleanA = domainA.trim().toLowerCase().replace(/^[a-zA-Z]+:\/\//, '').split('/')[0].split('?')[0].replace(/:\d+$/, '').replace(/^\.+|\.+$/g, '');
-  const cleanB = domainB.trim().toLowerCase().replace(/^[a-zA-Z]+:\/\//, '').split('/')[0].split('?')[0].replace(/:\d+$/, '').replace(/^\.+|\.+$/g, '');
+  const cleanA = sanitizeDomainInput(domainA);
+  const cleanB = sanitizeDomainInput(domainB);
 
-  if (isPrivateOrLocalHost(cleanA) || isPrivateOrLocalHost(cleanB)) {
-    return res.status(400).json({ error: 'Localhost and private network lookups are disallowed.' });
+  if (
+    !cleanA ||
+    !cleanB ||
+    !isValidDomainFormat(cleanA) ||
+    !isValidDomainFormat(cleanB) ||
+    isPrivateOrLocalHost(cleanA) ||
+    isPrivateOrLocalHost(cleanB)
+  ) {
+    return res.status(400).json({ error: 'Invalid or disallowed domain parameters. Only valid public domain names are permitted.' });
   }
 
   try {
@@ -1801,6 +1922,178 @@ const handleWhoisDiff = async (req: express.Request, res: express.Response) => {
 
 app.get('/api/whois-diff', handleWhoisDiff);
 app.post('/api/whois-diff', handleWhoisDiff);
+
+function escapeHtmlAttr(val: string): string {
+  return val
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function sanitizePreviewHtml(rawHtml: string, baseUrl: string): string {
+  let html = rawHtml;
+
+  // Strip executable and nested-browsing elements completely
+  html = html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script\b[^>]*>[\s\S]*/gi, '')
+    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, '')
+    .replace(/<iframe\b[^>]*\/?>/gi, '')
+    .replace(/<frame\b[^>]*>[\s\S]*?<\/frame>/gi, '')
+    .replace(/<frame\b[^>]*\/?>/gi, '')
+    .replace(/<frameset\b[^>]*>[\s\S]*?<\/frameset>/gi, '')
+    .replace(/<object\b[^>]*>[\s\S]*?<\/object>/gi, '')
+    .replace(/<embed\b[^>]*\/?>/gi, '')
+    .replace(/<applet\b[^>]*>[\s\S]*?<\/applet>/gi, '')
+    .replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject>/gi, '')
+    .replace(/<base\b[^>]*>/gi, '')
+    .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?\s*(?:refresh|content-security-policy|set-cookie)[^>]*>/gi, '')
+    .replace(/<link\b[^>]*\bas\s*=\s*["']?\s*(?:script|worker|sharedworker|serviceworker)[^>]*>/gi, '');
+
+  // Scrub inline event handlers (on*), srcdoc, and dangerous URI schemes inside element tags
+  html = html.replace(/<([a-zA-Z][a-zA-Z0-9:-]*)(\s+[^>]*)?>/g, (fullMatch, tagName: string, rawAttrs?: string) => {
+    if (!rawAttrs) return fullMatch;
+    let attrs = rawAttrs;
+
+    // Remove on* event handler attributes and srcdoc repeatedly to handle adjacent attributes
+    let prev = '';
+    while (attrs !== prev) {
+      prev = attrs;
+      attrs = attrs
+        .replace(/\s+on[a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+        .replace(/\s+srcdoc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+    }
+
+    // Neutralize javascript:, vbscript:, or data:text/html in URL-bearing attributes
+    attrs = attrs.replace(
+      /\b(href|src|action|formaction|xlink:href|poster|data)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/gi,
+      (attrMatch, attrName: string, _quoted: string, dVal?: string, sVal?: string, uVal?: string) => {
+        const rawVal = (dVal ?? sVal ?? uVal ?? '').replace(/[\u0000-\u0020]+/g, '').toLowerCase();
+        if (
+          rawVal.startsWith('javascript:') ||
+          rawVal.startsWith('vbscript:') ||
+          rawVal.startsWith('data:text/html') ||
+          rawVal.startsWith('data:application/xhtml')
+        ) {
+          return `${attrName}="about:blank"`;
+        }
+        return attrMatch;
+      }
+    );
+
+    const selfClosing = rawAttrs.trimEnd().endsWith('/') ? '/' : '';
+    const cleanedAttrs = attrs.replace(/\/\s*$/, '');
+    return `<${tagName}${cleanedAttrs}${selfClosing}>`;
+  });
+
+  let safeBaseTag = '';
+  try {
+    const parsedBase = new URL(baseUrl);
+    if (parsedBase.protocol === 'http:' || parsedBase.protocol === 'https:') {
+      safeBaseTag = `<base href="${escapeHtmlAttr(parsedBase.href)}">`;
+    }
+  } catch {}
+
+  const cspMeta =
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'none\'; object-src \'none\'; base-uri https: http:; style-src \'unsafe-inline\' https: http:; font-src https: http: data:; img-src https: http: data:; media-src \'none\'; frame-src \'none\'; connect-src \'none\'; form-action \'none\';">';
+  const readOnlyStyle =
+    '<style>a,button,input,select,textarea,form{pointer-events:none!important;}</style>';
+  const headInjection = `${cspMeta}${safeBaseTag}${readOnlyStyle}`;
+
+  if (/<head\b[^>]*>/i.test(html)) {
+    return html.replace(/<head\b[^>]*>/i, (m) => `${m}${headInjection}`);
+  }
+  if (/<html\b[^>]*>/i.test(html)) {
+    return html.replace(/<html\b[^>]*>/i, (m) => `${m}<head>${headInjection}</head>`);
+  }
+  return `<!doctype html><html><head><meta charset="utf-8">${headInjection}</head><body>${html}</body></html>`;
+}
+
+app.get('/api/preview', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  const rawDomain = req.query.domain;
+  if (typeof rawDomain !== 'string' || !rawDomain.trim()) {
+    return res.status(400).json({ error: 'Domain parameter is required' });
+  }
+
+  const clean = sanitizeDomainInput(rawDomain);
+
+  if (!clean || !isValidDomainFormat(clean) || isPrivateOrLocalHost(clean)) {
+    return res.status(400).json({ error: 'Invalid or disallowed domain parameter. Only valid public domain names are permitted.' });
+  }
+
+  const userAgent = getUserAgent(req);
+  let targetRes: Response | null = null;
+  let attemptUrl = `https://${clean}`;
+
+  for (const scheme of ['https', 'http']) {
+    attemptUrl = `${scheme}://${clean}`;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      const r = await safeFetch(attemptUrl, {
+        method: 'GET',
+        headers: {
+          'User-Agent': userAgent,
+          Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
+        },
+        signal: controller.signal,
+        maxRedirects: 4,
+      });
+      clearTimeout(timeout);
+      targetRes = r;
+      break;
+    } catch {
+      targetRes = null;
+    }
+  }
+
+  if (!targetRes) {
+    return res.status(502).json({ error: `Unable to connect to ${clean} over HTTPS or HTTP.` });
+  }
+
+  const finalUrl = ((targetRes as any).finalUrl as string) || targetRes.url || attemptUrl;
+  const contentType = (targetRes.headers.get('content-type') || '').toLowerCase();
+  const isHtmlLike =
+    !contentType ||
+    contentType.includes('text/html') ||
+    contentType.includes('application/xhtml') ||
+    contentType.includes('text/plain');
+
+  if (!isHtmlLike) {
+    try {
+      await targetRes.body?.cancel();
+    } catch {}
+    return res.status(415).json({
+      error: `Target returned non-HTML content (${contentType.split(';')[0] || 'unknown'}).`,
+      statusCode: targetRes.status,
+      finalUrl,
+    });
+  }
+
+  try {
+    const rawHtml = await readBoundedResponseText(targetRes, MAX_HTML_RECON_BYTES);
+    if (!rawHtml.trim()) {
+      return res.status(502).json({
+        error: `Target returned an empty response body (HTTP ${targetRes.status}).`,
+        statusCode: targetRes.status,
+        finalUrl,
+      });
+    }
+    const sanitizedHtml = sanitizePreviewHtml(rawHtml, finalUrl);
+    return res.json({
+      html: sanitizedHtml,
+      finalUrl,
+      statusCode: targetRes.status,
+    });
+  } catch (err: any) {
+    return res.status(502).json({ error: err?.message || 'Failed to read target HTML for preview.' });
+  }
+});
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

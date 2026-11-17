@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import React from 'react';
-import { Search, Loader2 } from 'lucide-react';
+import { Search } from 'lucide-react';
+import { CustomSpinner } from './CustomSpinner';
 import { sanitizeDomainInput, isValidDomainFormat } from '../services/whoisDiffService';
 
 interface WhoisDiffInputProps {
@@ -25,9 +26,9 @@ export const WhoisDiffInput: React.FC<WhoisDiffInputProps> = ({
 }) => {
   const cleanA = sanitizeDomainInput(domainA);
   const cleanB = sanitizeDomainInput(domainB);
-  const isValidA = !domainA || isValidDomainFormat(cleanA);
-  const isValidB = !domainB || isValidDomainFormat(cleanB);
-  const canCompare = cleanA && cleanB && isValidA && isValidB && !isLoading;
+  const isValidA = !domainA.trim() || isValidDomainFormat(cleanA);
+  const isValidB = !domainB.trim() || isValidDomainFormat(cleanB);
+  const canCompare = Boolean((cleanA || cleanB) && isValidA && isValidB && !isLoading);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && canCompare) {
@@ -111,7 +112,7 @@ export const WhoisDiffInput: React.FC<WhoisDiffInputProps> = ({
               className="h-10 px-5 text-xs font-mono font-bold flex items-center justify-center gap-2 bg-gradient-to-r from-[#c30800] to-[#770500] hover:from-[#f60a00] hover:to-[#770500] text-[#f3f3f7] border border-[#c30800] shadow-sm transition-all cursor-pointer uppercase tracking-wider disabled:opacity-40 disabled:cursor-not-allowed rounded-none"
             >
               {isLoading ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#f3f3f7]" />
+                <CustomSpinner className="w-4 h-4 text-[#f3f3f7] shrink-0" />
               ) : (
                 <Search className="w-3.5 h-3.5 text-[#f3f3f7]" />
               )}
@@ -123,7 +124,7 @@ export const WhoisDiffInput: React.FC<WhoisDiffInputProps> = ({
         {/* Loading Indicator or Error */}
         {isLoading && (
           <div className="mt-3 pt-3 border-t border-[#2e2e2e] flex items-center gap-2 text-xs font-mono text-[#8c8c8c]">
-            <Loader2 className="w-3.5 h-3.5 animate-spin text-[#c30800]" />
+            <CustomSpinner className="w-4 h-4 text-[#c30800] shrink-0" />
             <span>AGGREGATING WHOIS, REVERSE PIVOTS, CERTIFICATE TRANSPARENCY &amp; BGP NETWORK OSINT...</span>
           </div>
         )}

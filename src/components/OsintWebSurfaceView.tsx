@@ -22,6 +22,7 @@ export const WEB_RECON_FIELD_IDS = new Set<string>([
   'tls_validity',
   'passive_dns_records',
   'web_recon_status',
+  'web_probed_hosts',
   'http_headers',
   'csp_external_domains',
   'html_metadata',
@@ -59,6 +60,7 @@ const FIELD_SECTION_MAP: Record<string, WebSectionMeta> = {
   technologies: { key: 'dom_tech', label: 'DOM & TECHNOLOGY STACK', scope: 'dom_tech', icon: Code2 },
   http_headers: { key: 'headers', label: 'HTTP HEADERS & ACCESS', scope: 'headers', icon: Server },
   web_recon_status: { key: 'headers', label: 'HTTP HEADERS & ACCESS', scope: 'headers', icon: Server },
+  web_probed_hosts: { key: 'headers', label: 'HTTP HEADERS & ACCESS', scope: 'headers', icon: Server },
   csp_external_domains: { key: 'external', label: 'EXTERNAL DOMAINS & CSP', scope: 'external', icon: Globe },
   external_domains: { key: 'external', label: 'EXTERNAL DOMAINS & CSP', scope: 'external', icon: Globe },
   passive_dns_records: { key: 'pdns_tls', label: 'PASSIVE DNS & TLS VALIDITY', scope: 'pdns_tls', icon: Network },
@@ -86,6 +88,7 @@ const isUnavailableText = (raw: unknown): boolean => {
     s === 'no static assets enumerated' ||
     s === 'no external domains discovered' ||
     s === 'unreachable over http/https' ||
+    s === 'no reachable subdomains observed' ||
     s.startsWith('blocked by target cors policy')
   );
 };
@@ -100,6 +103,7 @@ const isFieldUnavailable = (val: string | string[] | null | undefined): boolean 
 
 export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }) => {
   const { domainA, domainB, fieldDiffs } = diff;
+  const isSingle = Boolean(diff.isSingleDomain || !domainB);
 
   const [activeScope, setActiveScope] = useState<WebScopeFilter>('all');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
@@ -121,7 +125,7 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
     const observer = new ResizeObserver(updateTheadHeight);
     if (theadRef.current) observer.observe(theadRef.current);
     return () => observer.disconnect();
-  }, [domainA.domainName, domainB.domainName]);
+  }, [domainA.domainName, domainB?.domainName]);
 
   const toggleRowExpand = useCallback((id: string) => {
     setExpandedRowIds((prev) => {
@@ -140,15 +144,21 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
 
   const fieldsBeforeScope = useMemo(() => {
     return webFields.filter((field) => {
-      if (statusFilter === 'diff_only' && field.status === 'MATCH') return false;
-      if (statusFilter === 'match_only' && field.status !== 'MATCH') return false;
-      if (hideUnavailable && isFieldUnavailable(field.valueA) && isFieldUnavailable(field.valueB)) {
+      if (!isSingle) {
+        if (statusFilter === 'diff_only' && field.status === 'MATCH') return false;
+        if (statusFilter === 'match_only' && field.status !== 'MATCH') return false;
+      }
+      if (hideUnavailable && isFieldUnavailable(field.valueA) && (isSingle || isFieldUnavailable(field.valueB))) {
         return false;
       }
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim();
         const strA = Array.isArray(field.valueA) ? field.valueA.join(' ') : String(field.valueA || '');
-        const strB = Array.isArray(field.valueB) ? field.valueB.join(' ') : String(field.valueB || '');
+        const strB = !isSingle
+          ? Array.isArray(field.valueB)
+            ? field.valueB.join(' ')
+            : String(field.valueB || '')
+          : '';
         return (
           field.label.toLowerCase().includes(q) ||
           (field.rfcOrSpec || '').toLowerCase().includes(q) ||
@@ -158,7 +168,7 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
       }
       return true;
     });
-  }, [webFields, statusFilter, hideUnavailable, searchQuery]);
+  }, [webFields, statusFilter, hideUnavailable, searchQuery, isSingle]);
 
   const filteredFields = useMemo(() => {
     if (activeScope === 'all') return fieldsBeforeScope;
@@ -257,7 +267,7 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
     <div
       ref={containerRef}
       id="web-recon-surface-view"
-      className="bg-[#141414] border border-[#383838] rounded-none overflow-x-clip flex flex-col relative mb-6"
+      className="bg-[#141414] border border-[#383838] rounded-none overflow-x-clip flex flex-col relative z-0 isolate mb-6"
     >
       <div className="h-[2px] w-full bg-gradient-to-r from-[#c30800] via-[#c300bb] to-[#bbc300]" />
 
@@ -292,7 +302,7 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
           <input
             type="text"
             maxLength={200}
-            placeholder="Filter headers, scripts, analytics IDs, passive DNS..."
+            placeholder="Filter headers, scripts, analytics IDs, passive DNS"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-8 pr-3 py-1 bg-[#141414] border border-[#2e2e2e] hover:border-[#383838] rounded-none text-xs text-[#f0f0f0] placeholder-[#737373] focus:outline-none focus:border-[#c30800]/60 font-mono transition-colors"
@@ -300,32 +310,34 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div
-            role="group"
-            aria-label="Web recon diff status filter"
-            className="inline-flex items-center bg-[#0d0d0d] border border-[#383838] rounded-none p-0.5 gap-0.5"
-          >
-            {(
-              [
-                { id: 'all', label: 'ALL' },
-                { id: 'diff_only', label: 'DIFFS' },
-                { id: 'match_only', label: 'MATCHES' },
-              ] as const
-            ).map((opt) => (
-              <button
-                key={opt.id}
-                type="button"
-                onClick={() => setStatusFilter(opt.id)}
-                className={`px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-none border cursor-pointer font-semibold transition-colors ${
-                  statusFilter === opt.id
-                    ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
-                    : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
-                }`}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
+          {!isSingle && (
+            <div
+              role="group"
+              aria-label="Web recon diff status filter"
+              className="inline-flex items-center bg-[#0d0d0d] border border-[#383838] rounded-none p-0.5 gap-0.5"
+            >
+              {(
+                [
+                  { id: 'all', label: 'ALL' },
+                  { id: 'diff_only', label: 'DIFFS' },
+                  { id: 'match_only', label: 'MATCHES' },
+                ] as const
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setStatusFilter(opt.id)}
+                  className={`px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-none border cursor-pointer font-semibold transition-colors ${
+                    statusFilter === opt.id
+                      ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
+                      : 'bg-[#141414] text-[#8c8c8c] border-transparent hover:text-[#f0f0f0]'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          )}
 
           <button
             type="button"
@@ -349,7 +361,12 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
             No web surface or passive DNS artifacts match the active filters.
           </div>
         ) : (
-          <table className="w-full text-left border-separate border-spacing-0 font-mono text-xs">
+          <table className="w-full table-fixed text-left border-separate border-spacing-0 font-mono text-xs">
+            <colgroup>
+              <col className="w-36 sm:w-56 md:w-64" />
+              <col />
+              {!isSingle && <col />}
+            </colgroup>
             <thead ref={theadRef}>
               <tr className="bg-[#141414] text-[10px] text-[#8c8c8c] uppercase tracking-wider select-none">
                 <th
@@ -362,16 +379,22 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
                   style={{ top: 'var(--matrix-sticky-top, 101px)' }}
                   className="sticky z-20 bg-[#141414] shadow-[inset_0_-1px_0_#383838,inset_1px_0_0_#2e2e2e] py-2 px-3 sm:px-4 font-semibold whitespace-nowrap"
                 >
-                  <span className="text-[#c30800] font-bold">A: </span>
-                  <span className="text-[#f0f0f0]">{domainA.domainName}</span>
+                  <div className="truncate">
+                    {!isSingle && <span className="text-[#c30800] font-bold">A: </span>}
+                    <span className="text-[#f0f0f0]">{domainA.domainName}</span>
+                  </div>
                 </th>
-                <th
-                  style={{ top: 'var(--matrix-sticky-top, 101px)' }}
-                  className="sticky z-20 bg-[#141414] shadow-[inset_0_-1px_0_#383838,inset_1px_0_0_#2e2e2e] py-2 px-3 sm:px-4 font-semibold whitespace-nowrap"
-                >
-                  <span className="text-[#c300bb] font-bold">B: </span>
-                  <span className="text-[#f0f0f0]">{domainB.domainName}</span>
-                </th>
+                {!isSingle && domainB && (
+                  <th
+                    style={{ top: 'var(--matrix-sticky-top, 101px)' }}
+                    className="sticky z-20 bg-[#141414] shadow-[inset_0_-1px_0_#383838,inset_1px_0_0_#2e2e2e] py-2 px-3 sm:px-4 font-semibold whitespace-nowrap"
+                  >
+                    <div className="truncate">
+                      <span className="text-[#c300bb] font-bold">B: </span>
+                      <span className="text-[#f0f0f0]">{domainB.domainName}</span>
+                    </div>
+                  </th>
+                )}
               </tr>
             </thead>
             {groupedSections.map(({ meta, fields }) => {
@@ -380,7 +403,7 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
                 <tbody key={meta.label}>
                   <tr className="select-none">
                     <td
-                      colSpan={3}
+                      colSpan={isSingle ? 2 : 3}
                       style={{ top: 'calc(var(--matrix-sticky-top, 101px) + var(--matrix-thead-height, 32px))' }}
                       className="sticky z-10 bg-[#0d0d0d] shadow-[inset_0_1px_0_#383838,inset_0_-1px_0_#383838] py-1.5 px-3 sm:px-4 font-mono text-[10px] font-bold text-[#8c8c8c] uppercase tracking-wider"
                     >
@@ -394,7 +417,8 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
 
                   {fields.map((field) => {
                     const isDiff =
-                      field.status === 'DIFF' || field.status === 'ONLY_A' || field.status === 'ONLY_B';
+                      !isSingle &&
+                      (field.status === 'DIFF' || field.status === 'ONLY_A' || field.status === 'ONLY_B');
                     const isArrA = Array.isArray(field.valueA);
                     const isArrB = Array.isArray(field.valueB);
                     const isExpanded = expandedRowIds.has(field.id);
@@ -402,9 +426,11 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
                     const canExpandA = isArrA
                       ? (field.valueA as string[]).length > 4
                       : String(field.valueA ?? '').length > 180;
-                    const canExpandB = isArrB
-                      ? (field.valueB as string[]).length > 4
-                      : String(field.valueB ?? '').length > 180;
+                    const canExpandB = !isSingle
+                      ? isArrB
+                        ? (field.valueB as string[]).length > 4
+                        : String(field.valueB ?? '').length > 180
+                      : false;
                     const canExpandRow = canExpandA || canExpandB;
 
                     const handleRowClick = () => {
@@ -434,17 +460,23 @@ export const OsintWebSurfaceView: React.FC<OsintWebSurfaceViewProps> = ({ diff }
                           </div>
                         </td>
 
-                        <td className={`py-2.5 px-3 sm:px-4 align-top border-r border-b border-[#2e2e2e] ${isDiff ? 'bg-[#c30800]/5' : ''}`}>
+                        <td
+                          className={`py-2.5 px-3 sm:px-4 align-top border-b border-[#2e2e2e] ${
+                            !isSingle ? 'border-r' : ''
+                          } ${isDiff ? 'bg-[#c30800]/5' : ''}`}
+                        >
                           {isArrA
                             ? renderArrayValues(field.valueA as string[], isExpanded)
                             : renderSingleValue(field.valueA, isExpanded)}
                         </td>
 
-                        <td className={`py-2.5 px-3 sm:px-4 align-top border-b border-[#2e2e2e] ${isDiff ? 'bg-[#c300bb]/5' : ''}`}>
-                          {isArrB
-                            ? renderArrayValues(field.valueB as string[], isExpanded)
-                            : renderSingleValue(field.valueB, isExpanded)}
-                        </td>
+                        {!isSingle && (
+                          <td className={`py-2.5 px-3 sm:px-4 align-top border-b border-[#2e2e2e] ${isDiff ? 'bg-[#c300bb]/5' : ''}`}>
+                            {isArrB
+                              ? renderArrayValues(field.valueB as string[], isExpanded)
+                              : renderSingleValue(field.valueB, isExpanded)}
+                          </td>
+                        )}
                       </tr>
                     );
                   })}

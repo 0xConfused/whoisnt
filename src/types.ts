@@ -54,6 +54,7 @@ export interface WhoisDomainRecord {
   // OSINT: Passive DNS (Historical Resolutions)
   passiveDnsDisplay?: string[];
   passiveDnsIps?: string[];
+  pdnsQueriedSubdomainsCount?: number;
 
   // OSINT: Live TLS Handshake & Certificate Inspection
   tlsSubjectCn?: string;
@@ -97,6 +98,8 @@ export interface WhoisDomainRecord {
   webReconMode?: 'server-direct' | 'browser-cors' | 'cors-blocked' | 'unreachable';
   webFinalUrl?: string;
   inspectedScriptsCount?: number;
+  webReconProbedHostsCount?: number;
+  webReconReachableHosts?: string[];
 
   // HTML Metadata & DOM Inspection
   htmlTitle?: string;
@@ -188,8 +191,9 @@ export interface WhoisDiffSummary {
 }
 
 export interface WhoisDiffResult {
+  isSingleDomain?: boolean;
   domainA: WhoisDomainRecord;
-  domainB: WhoisDomainRecord;
+  domainB?: WhoisDomainRecord;
   fieldDiffs: FieldDiffItem[];
   summary: WhoisDiffSummary;
   rawTextDiff: TextDiffLine[];

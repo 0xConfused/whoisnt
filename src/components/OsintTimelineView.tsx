@@ -3,10 +3,6 @@
 import React, { useState, useMemo, useRef, useCallback } from 'react';
 import { WhoisDiffResult } from '../types';
 import { parseFlexibleDateMs } from '../utils/dateUtils';
-import {
-  Copy,
-  Check,
-} from 'lucide-react';
 
 interface OsintTimelineViewProps {
   diff: WhoisDiffResult;
@@ -26,8 +22,8 @@ interface TimelineEvent {
 
 export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) => {
   const { domainA, domainB } = diff;
+  const isSingle = Boolean(diff.isSingleDomain || !domainB);
   const [hoveredEventId, setHoveredEventId] = useState<string | null>(null);
-  const [copiedId, setCopiedId] = useState<string | null>(null);
   const hitTargetsRef = useRef<Record<string, { badge: HTMLSpanElement | null; pin: HTMLDivElement | null }>>({});
 
   const registerTarget = useCallback(
@@ -79,14 +75,6 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
 
     setHoveredEventId((prev) => (prev === bestId ? prev : bestId));
   }, []);
-
-  const handleCopy = (text: string, id: string) => {
-    try {
-      navigator.clipboard.writeText(text);
-      setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 1800);
-    } catch {}
-  };
 
   const formatDateUtc = (ts: number): string => {
     const iso = new Date(ts).toISOString();
@@ -149,52 +137,54 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
     }
 
     // Domain B events
-    if (domainB.createdDate) {
-      const ts = parseFlexibleDateMs(domainB.createdDate);
-      if (ts !== null && !isNaN(ts)) {
-        list.push({
-          id: 'created_b',
-          domainKey: 'B',
-          domainName: domainB.domainName,
-          label: 'Domain Inception (Registration)',
-          dateStr: formatDateUtc(ts),
-          timestamp: ts,
-          type: 'created',
-          isSignificant: true,
-          notes: domainB.domainAgeFormatted || 'Inception record',
-        });
+    if (domainB && !isSingle) {
+      if (domainB.createdDate) {
+        const ts = parseFlexibleDateMs(domainB.createdDate);
+        if (ts !== null && !isNaN(ts)) {
+          list.push({
+            id: 'created_b',
+            domainKey: 'B',
+            domainName: domainB.domainName,
+            label: 'Domain Inception (Registration)',
+            dateStr: formatDateUtc(ts),
+            timestamp: ts,
+            type: 'created',
+            isSignificant: true,
+            notes: domainB.domainAgeFormatted || 'Inception record',
+          });
+        }
       }
-    }
 
-    if (domainB.updatedDate) {
-      const ts = parseFlexibleDateMs(domainB.updatedDate);
-      if (ts !== null && !isNaN(ts)) {
-        list.push({
-          id: 'updated_b',
-          domainKey: 'B',
-          domainName: domainB.domainName,
-          label: 'Registry State Synchronization',
-          dateStr: formatDateUtc(ts),
-          timestamp: ts,
-          type: 'updated',
-        });
+      if (domainB.updatedDate) {
+        const ts = parseFlexibleDateMs(domainB.updatedDate);
+        if (ts !== null && !isNaN(ts)) {
+          list.push({
+            id: 'updated_b',
+            domainKey: 'B',
+            domainName: domainB.domainName,
+            label: 'Registry State Synchronization',
+            dateStr: formatDateUtc(ts),
+            timestamp: ts,
+            type: 'updated',
+          });
+        }
       }
-    }
 
-    if (domainB.expiresDate) {
-      const ts = parseFlexibleDateMs(domainB.expiresDate);
-      if (ts !== null && !isNaN(ts)) {
-        list.push({
-          id: 'expires_b',
-          domainKey: 'B',
-          domainName: domainB.domainName,
-          label: 'Registry Expiration Horizon',
-          dateStr: new Date(ts).toISOString().split('T')[0],
-          timestamp: ts,
-          type: 'expires',
-          isSignificant: true,
-          notes: `${domainB.daysUntilExpiration || 0} days remaining (${(domainB.expirationStatus || 'active').toUpperCase()})`,
-        });
+      if (domainB.expiresDate) {
+        const ts = parseFlexibleDateMs(domainB.expiresDate);
+        if (ts !== null && !isNaN(ts)) {
+          list.push({
+            id: 'expires_b',
+            domainKey: 'B',
+            domainName: domainB.domainName,
+            label: 'Registry Expiration Horizon',
+            dateStr: new Date(ts).toISOString().split('T')[0],
+            timestamp: ts,
+            type: 'expires',
+            isSignificant: true,
+            notes: `${domainB.daysUntilExpiration || 0} days remaining (${(domainB.expirationStatus || 'active').toUpperCase()})`,
+          });
+        }
       }
     }
 
@@ -215,7 +205,7 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
       minTs: padMin,
       maxTs: padMax,
     };
-  }, [domainA, domainB]);
+  }, [domainA, domainB, isSingle]);
 
   const getPercentage = (ts: number) => {
     const total = maxTs - minTs;
@@ -272,18 +262,20 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
   };
 
   return (
-    <div id="timeline-recon-view" className="bg-[#141414] border border-[#383838] rounded-none overflow-hidden flex flex-col relative mb-6">
+    <div id="timeline-recon-view" className="bg-[#141414] border border-[#383838] rounded-none overflow-hidden flex flex-col relative z-0 isolate mb-6">
       <div className="h-[2px] w-full bg-gradient-to-r from-[#c30800] via-[#c300bb] to-[#bbc300]" />
 
       {/* Minimal Toolbar */}
       <div className="px-4 py-2.5 bg-[#141414] border-b border-[#383838] flex flex-wrap items-center justify-between gap-3 text-[10px] font-mono text-[#8c8c8c]">
         <div className="flex flex-wrap items-center gap-4">
           <span>
-            <strong className="text-[#c30800]">{domainA.domainName}</strong> [A]
+            <strong className="text-[#c30800]">{domainA.domainName}</strong>{!isSingle ? ' [A]' : ''}
           </span>
-          <span>
-            <strong className="text-[#c300bb]">{domainB.domainName}</strong> [B]
-          </span>
+          {domainB && !isSingle && (
+            <span>
+              <strong className="text-[#c300bb]">{domainB.domainName}</strong> [B]
+            </span>
+          )}
         </div>
       </div>
 
@@ -300,11 +292,13 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
 
           {/* Track Labels */}
           <span className="absolute top-1.5 left-2.5 text-[9px] font-mono uppercase tracking-wider text-[#c30800]/80 pointer-events-none">
-            [A] {domainA.domainName}
+            {isSingle ? domainA.domainName : `[A] ${domainA.domainName}`}
           </span>
-          <span className="absolute bottom-1.5 left-2.5 text-[9px] font-mono uppercase tracking-wider text-[#c300bb]/80 pointer-events-none">
-            [B] {domainB.domainName}
-          </span>
+          {domainB && !isSingle && (
+            <span className="absolute bottom-1.5 left-2.5 text-[9px] font-mono uppercase tracking-wider text-[#c300bb]/80 pointer-events-none">
+              [B] {domainB.domainName}
+            </span>
+          )}
 
           {/* Present (NOW) Marker Line */}
           <div
@@ -413,19 +407,17 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
                 <th className="py-2 px-4 font-semibold w-36">Date (UTC)</th>
                 <th className="py-2 px-4 font-semibold w-48">Horizon / Age</th>
                 <th className="py-2 px-4 font-semibold">Notes</th>
-                <th className="py-2 px-3 text-right font-semibold w-20">Action</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#2e2e2e]">
               {events.map((ev) => {
-                const isCopied = copiedId === ev.id;
                 const isHovered = hoveredEventId === ev.id;
                 return (
                   <tr
                     key={ev.id}
                     onMouseEnter={() => setHoveredEventId(ev.id)}
                     onMouseLeave={() => setHoveredEventId(null)}
-                    className={`transition-colors group cursor-pointer ${
+                    className={`transition-colors group ${
                       isHovered ? 'bg-[#1a1a1a]' : 'hover:bg-[#1a1a1a]/80'
                     }`}
                   >
@@ -451,16 +443,6 @@ export const OsintTimelineView: React.FC<OsintTimelineViewProps> = ({ diff }) =>
                         : ev.type === 'expires'
                         ? 'Registry purge threshold if unrenewed'
                         : 'Authoritative nameserver/RDAP sync'}
-                    </td>
-                    <td className="py-2.5 px-3 text-right align-middle">
-                      <button
-                        type="button"
-                        onClick={() => handleCopy(`${ev.domainName} ${ev.label}: ${ev.dateStr}`, ev.id)}
-                        className="px-2 py-0.5 text-[10px] font-mono border border-[#383838] bg-[#141414] hover:bg-[#262626] text-[#8c8c8c] hover:text-[#f0f0f0] transition-colors rounded-none cursor-pointer inline-flex items-center gap-1"
-                      >
-                        {isCopied ? <Check className="w-2.5 h-2.5 text-[#bbc300]" /> : <Copy className="w-2.5 h-2.5" />}
-                        <span>{isCopied ? 'COPIED' : 'COPY'}</span>
-                      </button>
                     </td>
                   </tr>
                 );

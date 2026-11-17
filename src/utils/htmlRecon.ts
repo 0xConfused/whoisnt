@@ -50,7 +50,7 @@ const ALLOWED_RESPONSE_HEADERS = new Set([
   'x-wix-request-id',
 ]);
 
-interface StaticHtmlReconResult {
+export interface StaticHtmlReconResult {
   httpHeaderSummary: string[];
   cspExternalDomains: string[];
   htmlTitle?: string;
@@ -941,5 +941,156 @@ export function selectFirstPartyScriptsForInspection(
   }
 
   return candidates;
+}
+
+export interface SubdomainWebProbeEntry {
+  host: string;
+  httpWebServer?: string;
+  httpStatusCode?: number;
+  webFinalUrl?: string;
+  inspectedScriptsCount?: number;
+  recon?: StaticHtmlReconResult;
+  fallbackHeaders?: string[];
+}
+
+export interface AggregatedWebReconResult {
+  httpWebServer?: string;
+  httpStatusCode?: number;
+  httpHeaderSummary?: string[];
+  cspExternalDomains?: string[];
+  webReconMode: 'server-direct' | 'browser-cors' | 'cors-blocked' | 'unreachable';
+  webFinalUrl?: string;
+  inspectedScriptsCount?: number;
+  webReconProbedHostsCount: number;
+  webReconReachableHosts: string[];
+  htmlTitle?: string;
+  htmlDescription?: string;
+  htmlGenerator?: string;
+  htmlAuthor?: string;
+  htmlRobots?: string;
+  canonicalUrl?: string;
+  openGraphSiteName?: string;
+  twitterSite?: string;
+  htmlVerificationTokens?: VerificationTokenItem[];
+  domMarkers?: string[];
+  domStats?: string;
+  scriptUrls?: string[];
+  resourceSummary?: string[];
+  analyticsIds?: string[];
+  footerCopyrights?: string[];
+  copyrightEntities?: string[];
+  technologies?: string[];
+  externalDomains?: string[];
+}
+
+export function mergeSubdomainWebRecon(
+  apexDomain: string,
+  entries: SubdomainWebProbeEntry[],
+  totalProbedCount: number,
+  successMode: 'server-direct' | 'browser-cors'
+): AggregatedWebReconResult {
+  if (!entries || entries.length === 0) {
+    return {
+      webReconMode: successMode === 'server-direct' ? 'unreachable' : 'cors-blocked',
+      webReconProbedHostsCount: totalProbedCount,
+      webReconReachableHosts: [],
+    };
+  }
+
+  const apex = (extractApexDomain(apexDomain) || apexDomain).toLowerCase();
+  const wwwHost = `www.${apex}`;
+
+  const rankEntry = (e: SubdomainWebProbeEntry): number => {
+    const isOk = typeof e.httpStatusCode === 'number' && e.httpStatusCode >= 200 && e.httpStatusCode < 400;
+    const hasHtml = Boolean(e.recon);
+    const hostScore = e.host === apex ? 0 : e.host === wwwHost ? 1 : 2;
+    return (hasHtml ? 0 : 10) + (isOk ? 0 : 5) + hostScore;
+  };
+
+  const ordered = [...entries].sort((a, b) => rankEntry(a) - rankEntry(b));
+  const primary = ordered[0];
+
+  const headerSet = new Set<string>();
+  const cspSet = new Set<string>();
+  const tokenMap = new Map<string, VerificationTokenItem>();
+  const domMarkerSet = new Set<string>();
+  const scriptSet = new Set<string>();
+  const resourceSet = new Set<string>();
+  const analyticsSet = new Set<string>();
+  const copyrightSet = new Set<string>();
+  const entitySet = new Set<string>();
+  const techSet = new Set<string>();
+  const extDomainSet = new Set<string>();
+  const reachableHosts = new Set<string>();
+  const serverSet = new Set<string>();
+
+  let totalScriptsInspected = 0;
+
+  for (const entry of ordered) {
+    reachableHosts.add(entry.host);
+    totalScriptsInspected += entry.inspectedScriptsCount || 0;
+    if (entry.httpWebServer) serverSet.add(entry.httpWebServer);
+
+    if (entry.fallbackHeaders) {
+      entry.fallbackHeaders.forEach((h) => headerSet.add(h));
+    }
+
+    const r = entry.recon;
+    if (!r) continue;
+
+    r.httpHeaderSummary.forEach((h) => headerSet.add(h));
+    r.cspExternalDomains.forEach((d) => cspSet.add(d));
+    r.htmlVerificationTokens.forEach((tok) => {
+      const key = `${tok.provider.toLowerCase()}::${tok.token}`;
+      if (!tokenMap.has(key)) tokenMap.set(key, tok);
+    });
+    r.domMarkers.forEach((m) => domMarkerSet.add(m));
+    r.scriptUrls.forEach((u) => scriptSet.add(u));
+    r.resourceSummary.forEach((resItem) => resourceSet.add(resItem));
+    r.analyticsIds.forEach((id) => analyticsSet.add(id));
+    r.footerCopyrights.forEach((c) => copyrightSet.add(c));
+    r.copyrightEntities.forEach((e) => entitySet.add(e));
+    r.technologies.forEach((t) => techSet.add(t));
+    r.externalDomains.forEach((d) => extDomainSet.add(d));
+  }
+
+  const pickFirst = (getter: (r: StaticHtmlReconResult) => string | undefined): string | undefined => {
+    for (const entry of ordered) {
+      if (!entry.recon) continue;
+      const val = getter(entry.recon);
+      if (val) return val;
+    }
+    return undefined;
+  };
+
+  return {
+    httpWebServer: primary.httpWebServer || Array.from(serverSet)[0],
+    httpStatusCode: primary.httpStatusCode,
+    httpHeaderSummary: Array.from(headerSet).sort().slice(0, 120),
+    cspExternalDomains: Array.from(cspSet).sort(),
+    webReconMode: successMode,
+    webFinalUrl: primary.webFinalUrl,
+    inspectedScriptsCount: totalScriptsInspected,
+    webReconProbedHostsCount: totalProbedCount,
+    webReconReachableHosts: Array.from(reachableHosts).sort(),
+    htmlTitle: pickFirst((r) => r.htmlTitle),
+    htmlDescription: pickFirst((r) => r.htmlDescription),
+    htmlGenerator: pickFirst((r) => r.htmlGenerator),
+    htmlAuthor: pickFirst((r) => r.htmlAuthor),
+    htmlRobots: pickFirst((r) => r.htmlRobots),
+    canonicalUrl: pickFirst((r) => r.canonicalUrl),
+    openGraphSiteName: pickFirst((r) => r.openGraphSiteName),
+    twitterSite: pickFirst((r) => r.twitterSite),
+    htmlVerificationTokens: Array.from(tokenMap.values()),
+    domMarkers: Array.from(domMarkerSet).sort().slice(0, 100),
+    domStats: pickFirst((r) => r.domStats),
+    scriptUrls: Array.from(scriptSet).sort().slice(0, 120),
+    resourceSummary: Array.from(resourceSet).sort().slice(0, 120),
+    analyticsIds: Array.from(analyticsSet).sort(),
+    footerCopyrights: Array.from(copyrightSet).sort(),
+    copyrightEntities: Array.from(entitySet).sort(),
+    technologies: Array.from(techSet).sort(),
+    externalDomains: Array.from(extDomainSet).sort().slice(0, 150),
+  };
 }
 

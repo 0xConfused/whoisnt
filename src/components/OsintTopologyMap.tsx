@@ -2,6 +2,7 @@
 
 import React, { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
 import { WhoisDiffResult, WhoisDomainRecord } from '../types';
+import { CustomSpinner } from './CustomSpinner';
 
 interface OsintTopologyMapProps {
   diff: WhoisDiffResult;
@@ -34,6 +35,14 @@ interface NodePopupDetails {
   title: string;
   subtitle?: string;
   rows: PopupFieldRow[];
+}
+
+interface PreviewState {
+  loading: boolean;
+  html?: string;
+  finalUrl?: string;
+  statusCode?: number;
+  error?: string;
 }
 
 const CANVAS_WIDTH = 1120;
@@ -121,12 +130,13 @@ function appendDomainNetworkRows(
 
 function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodePopupDetails {
   const { domainA, domainB, summary } = diff;
+  const isSingle = Boolean(diff.isSingleDomain || !domainB);
   const kind = getNodeKindLabel(node);
   const rows: PopupFieldRow[] = [];
 
-  const hasSubnetNode = Boolean(summary.sameSubnet24 && domainA.subnet24);
+  const hasSubnetNode = Boolean((isSingle || summary.sameSubnet24) && domainA.subnet24);
   const hasPtrNode = Boolean(summary.sharedPtrHostnames && summary.sharedPtrHostnames.length > 0);
-  const hasTlsNode = Boolean(summary.sameTlsSubjectOrg && domainA.tlsSubjectOrg);
+  const hasTlsNode = Boolean((isSingle || summary.sameTlsSubjectOrg) && domainA.tlsSubjectOrg);
 
   const buildDomainOverview = (rec: WhoisDomainRecord): PopupFieldRow[] => {
     const out: PopupFieldRow[] = [];
@@ -171,19 +181,43 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
 
   if (node.id === 'domA') {
     rows.push(...buildDomainOverview(domainA));
-  } else if (node.id === 'domB') {
+  } else if (node.id === 'domB' && domainB) {
     rows.push(...buildDomainOverview(domainB));
-  } else if (node.id === 'shared_asn') {
+  } else if (node.id === 'shared_asn' && domainB) {
     const opts = { includeSubnet: !hasSubnetNode, includePtr: !hasPtrNode };
     appendDomainNetworkRows(rows, domainA.domainName, domainA, opts);
     appendDomainNetworkRows(rows, domainB.domainName, domainB, opts);
-  } else if (node.id === 'asn_a' || node.id === 'asn_b') {
-    const rec = node.id === 'asn_a' ? domainA : domainB;
+  } else if (node.id === 'asn_a' || (node.id === 'asn_b' && domainB)) {
+    const rec = node.id === 'asn_a' ? domainA : domainB!;
     appendDomainNetworkRows(rows, rec.domainName, rec, {
       includeSubnet: !hasSubnetNode,
       includePtr: !hasPtrNode,
     });
-  } else if (node.id === 'shared_subnet') {
+  } else if (node.id === 'subnet_a') {
+    if (domainA.asn) {
+      rows.push({ label: 'ASN', value: domainA.asnName ? `${domainA.asn} (${domainA.asnName})` : domainA.asn });
+    }
+    appendDomainNetworkRows(rows, domainA.domainName, domainA, { includePtr: true });
+  } else if (node.id === 'tls_a') {
+    if (domainA.tlsSubjectCn && domainA.tlsSubjectCn !== node.label) {
+      rows.push({ label: 'Subject CN', value: domainA.tlsSubjectCn });
+    }
+    if (domainA.tlsIssuerOrg || domainA.tlsIssuerCn) {
+      rows.push({ label: 'Issuer', value: domainA.tlsIssuerOrg || domainA.tlsIssuerCn || '' });
+    }
+    if (domainA.tlsProtocol || domainA.tlsCipher) {
+      rows.push({
+        label: 'Handshake',
+        value: [domainA.tlsProtocol, domainA.tlsCipher].filter(Boolean).join(' / '),
+      });
+    }
+    if (domainA.tlsValidityNotBefore || domainA.tlsValidityNotAfter) {
+      rows.push({
+        label: 'Validity',
+        value: `${domainA.tlsValidityNotBefore || '?'} -> ${domainA.tlsValidityNotAfter || '?'}`,
+      });
+    }
+  } else if (node.id === 'shared_subnet' && domainB) {
     if (!summary.sameAsn && domainA.asn && domainB.asn) {
       rows.push({
         label: 'ASNs',
@@ -192,7 +226,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
     }
     appendDomainNetworkRows(rows, domainA.domainName, domainA, { includePtr: !hasPtrNode });
     appendDomainNetworkRows(rows, domainB.domainName, domainB, { includePtr: !hasPtrNode });
-  } else if (node.id === 'shared_ns') {
+  } else if (node.id === 'shared_ns' && domainB) {
     const setNsB = new Set(domainB.nameservers.map((s) => s.toLowerCase()));
     const sharedNs = domainA.nameservers.filter((s) => setNsB.has(s.toLowerCase()));
     const sharedLower = new Set(sharedNs.map((s) => s.toLowerCase()));
@@ -205,15 +239,15 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
     if (extraA) rows.push({ label: `${domainA.domainName} Unique NS`, value: extraA });
     if (extraB) rows.push({ label: `${domainB.domainName} Unique NS`, value: extraB });
     if (domainA.dnsProvider) rows.push({ label: 'DNS Provider', value: domainA.dnsProvider });
-  } else if (node.id === 'ns_a' || node.id === 'ns_b') {
-    const rec = node.id === 'ns_a' ? domainA : domainB;
+  } else if (node.id === 'ns_a' || (node.id === 'ns_b' && domainB)) {
+    const rec = node.id === 'ns_a' ? domainA : domainB!;
     if (rec.nameservers.length > 1) {
       const allNs = formatList(rec.nameservers);
       if (allNs) rows.push({ label: 'Nameservers', value: allNs });
     }
     if (rec.soaMname) rows.push({ label: 'SOA Primary', value: rec.soaMname });
     if (rec.soaSerial) rows.push({ label: 'SOA Serial', value: rec.soaSerial });
-  } else if (node.id === 'shared_mail') {
+  } else if (node.id === 'shared_mail' && domainB) {
     if (domainA.spfRecord) rows.push({ label: `${domainA.domainName} SPF`, value: domainA.spfRecord });
     if (domainB.spfRecord) rows.push({ label: `${domainB.domainName} SPF`, value: domainB.spfRecord });
     if (domainA.dmarcPolicy || domainB.dmarcPolicy) {
@@ -222,13 +256,13 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
         value: `${domainA.domainName}: ${domainA.dmarcPolicy || 'none'}\n${domainB.domainName}: ${domainB.dmarcPolicy || 'none'}`,
       });
     }
-  } else if (node.id === 'mail_a' || node.id === 'mail_b') {
-    const rec = node.id === 'mail_a' ? domainA : domainB;
+  } else if (node.id === 'mail_a' || (node.id === 'mail_b' && domainB)) {
+    const rec = node.id === 'mail_a' ? domainA : domainB!;
     if (rec.spfRecord) rows.push({ label: 'SPF Record', value: rec.spfRecord });
     if (rec.dmarcPolicy) rows.push({ label: 'DMARC Policy', value: rec.dmarcPolicy });
     const dkim = formatList(rec.dkimSelectors);
     if (dkim) rows.push({ label: 'DKIM Selectors', value: dkim });
-  } else if (node.id === 'shared_tokens') {
+  } else if (node.id === 'shared_tokens' && domainB) {
     const tokensA = [...(domainA.verificationTokens || []), ...(domainA.htmlVerificationTokens || [])];
     const tokensB = new Set(
       [...(domainB.verificationTokens || []), ...(domainB.htmlVerificationTokens || [])].map(
@@ -240,7 +274,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
     uniqueMatched.forEach((t) => {
       rows.push({ label: t.provider, value: t.token });
     });
-  } else if (node.id === 'shared_analytics') {
+  } else if (node.id === 'shared_analytics' && domainB) {
     if ((summary.sharedAnalyticsIds || []).length > 1) {
       const allShared = formatList(summary.sharedAnalyticsIds);
       if (allShared) rows.push({ label: 'Shared IDs', value: allShared });
@@ -250,7 +284,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
     const uniqB = formatList((domainB.analyticsIds || []).filter((id) => !sharedSet.has(id.toLowerCase())));
     if (uniqA) rows.push({ label: `${domainA.domainName} Unique`, value: uniqA });
     if (uniqB) rows.push({ label: `${domainB.domainName} Unique`, value: uniqB });
-  } else if (node.id === 'shared_copyright') {
+  } else if (node.id === 'shared_copyright' && domainB) {
     if ((summary.sharedCopyrightEntities || []).length > 1) {
       const allShared = formatList(summary.sharedCopyrightEntities);
       if (allShared) rows.push({ label: 'Shared Entities', value: allShared });
@@ -259,7 +293,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
     const cB = formatList(domainB.footerCopyrights);
     if (cA) rows.push({ label: domainA.domainName, value: cA });
     if (cB) rows.push({ label: domainB.domainName, value: cB });
-  } else if (node.id === 'shared_pdns_ip') {
+  } else if (node.id === 'shared_pdns_ip' && domainB) {
     if ((summary.sharedPassiveDnsIps || []).length > 1) {
       const allShared = formatList(summary.sharedPassiveDnsIps);
       if (allShared) rows.push({ label: 'Shared PDNS IPs', value: allShared });
@@ -268,7 +302,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
     const pdB = formatList(domainB.passiveDnsDisplay);
     if (pdA) rows.push({ label: domainA.domainName, value: pdA });
     if (pdB) rows.push({ label: domainB.domainName, value: pdB });
-  } else if (node.id === 'shared_ext_domain') {
+  } else if (node.id === 'shared_ext_domain' && domainB) {
     if ((summary.sharedExternalDomains || []).length > 1) {
       const allShared = formatList(summary.sharedExternalDomains);
       if (allShared) rows.push({ label: 'Shared Origins', value: allShared });
@@ -277,7 +311,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
       label: 'Total External',
       value: `${domainA.domainName}: ${domainA.externalDomains?.length || 0}\n${domainB.domainName}: ${domainB.externalDomains?.length || 0}`,
     });
-  } else if (node.id === 'shared_tls_org') {
+  } else if (node.id === 'shared_tls_org' && domainB) {
     if (domainA.tlsSubjectCn && domainA.tlsSubjectCn !== node.label) {
       rows.push({ label: `${domainA.domainName} CN`, value: domainA.tlsSubjectCn });
     }
@@ -299,21 +333,21 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
         value: `${domainA.tlsValidityNotBefore || '?'} -> ${domainA.tlsValidityNotAfter || '?'}`,
       });
     }
-  } else if (node.id === 'shared_ptr') {
+  } else if (node.id === 'shared_ptr' && domainB) {
     if ((summary.sharedPtrHostnames || []).length > 1) {
       const allShared = formatList(summary.sharedPtrHostnames);
       if (allShared) rows.push({ label: 'Shared PTRs', value: allShared });
     }
     appendDomainNetworkRows(rows, domainA.domainName, domainA);
     appendDomainNetworkRows(rows, domainB.domainName, domainB);
-  } else if (node.id === 'shared_spf_ip') {
+  } else if (node.id === 'shared_spf_ip' && domainB) {
     if ((summary.sharedSpfIps || []).length > 1) {
       const allShared = formatList(summary.sharedSpfIps);
       if (allShared) rows.push({ label: 'Shared SPF IPs', value: allShared });
     }
     if (domainA.spfRecord) rows.push({ label: `${domainA.domainName} SPF`, value: domainA.spfRecord });
     if (domainB.spfRecord) rows.push({ label: `${domainB.domainName} SPF`, value: domainB.spfRecord });
-  } else if (node.id === 'shared_soa_rname') {
+  } else if (node.id === 'shared_soa_rname' && domainB) {
     if (domainA.soaMname) {
       rows.push({
         label: domainA.domainName,
@@ -326,7 +360,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
         value: `${domainB.soaMname}${domainB.soaSerial ? ` (serial ${domainB.soaSerial})` : ''}`,
       });
     }
-  } else if (node.id === 'shared_dmarc') {
+  } else if (node.id === 'shared_dmarc' && domainB) {
     if (domainA.dmarcRua && domainA.dmarcRua !== node.label) {
       rows.push({ label: 'Aggregate (RUA)', value: domainA.dmarcRua });
     }
@@ -337,7 +371,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
       label: 'Policies',
       value: `${domainA.domainName}: ${domainA.dmarcPolicy || 'none'}\n${domainB.domainName}: ${domainB.dmarcPolicy || 'none'}`,
     });
-  } else if (node.id === 'shared_dkim') {
+  } else if (node.id === 'shared_dkim' && domainB) {
     if ((summary.sharedDkimTargets || []).length > 1) {
       const allShared = formatList(summary.sharedDkimTargets);
       if (allShared) rows.push({ label: 'Shared Targets', value: allShared });
@@ -346,14 +380,14 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
     const selB = formatList(domainB.dkimSelectors);
     if (selA) rows.push({ label: `${domainA.domainName} Selectors`, value: selA });
     if (selB) rows.push({ label: `${domainB.domainName} Selectors`, value: selB });
-  } else if (node.id === 'shared_registrar') {
+  } else if (node.id === 'shared_registrar' && domainB) {
     if (domainA.abuseContactEmail) rows.push({ label: 'Abuse Email', value: domainA.abuseContactEmail });
     const stA = formatList(domainA.status);
     const stB = formatList(domainB.status);
     if (stA) rows.push({ label: `${domainA.domainName} Status`, value: stA });
     if (stB) rows.push({ label: `${domainB.domainName} Status`, value: stB });
-  } else if (node.id === 'reg_a' || node.id === 'reg_b') {
-    const rec = node.id === 'reg_a' ? domainA : domainB;
+  } else if (node.id === 'reg_a' || (node.id === 'reg_b' && domainB)) {
+    const rec = node.id === 'reg_a' ? domainA : domainB!;
     if (rec.abuseContactEmail) rows.push({ label: 'Abuse Email', value: rec.abuseContactEmail });
     if (rec.registrantOrg) rows.push({ label: 'Registrant Org', value: rec.registrantOrg });
     if (rec.registrantCountry) rows.push({ label: 'Country', value: rec.registrantCountry });
@@ -363,14 +397,14 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
 
   const badgePrefix =
     node.type === 'domainA'
-      ? 'TARGET A'
+      ? isSingle ? 'TARGET' : 'TARGET A'
       : node.type === 'domainB'
       ? 'TARGET B'
       : node.type === 'shared'
       ? 'SHARED HUB'
       : node.type === 'uniqueA'
       ? `${domainA.domainName}`
-      : `${domainB.domainName}`;
+      : `${domainB?.domainName || ''}`;
 
   const normSub = node.sublabel.trim().toUpperCase();
   const normKind = kind.trim().toUpperCase();
@@ -393,6 +427,7 @@ function buildNodePopupDetails(node: TopologyNode, diff: WhoisDiffResult): NodeP
 
 export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
   const { domainA, domainB, summary } = diff;
+  const isSingle = Boolean(diff.isSingleDomain || !domainB);
 
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<'all' | 'shared' | 'network' | 'dns'>('all');
@@ -400,6 +435,8 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [vpSize, setVpSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [popupHeight, setPopupHeight] = useState<number>(280);
+  const [previewOpen, setPreviewOpen] = useState<boolean>(false);
+  const [previewCache, setPreviewCache] = useState<Record<string, PreviewState>>({});
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const popupRef = useRef<HTMLDivElement | null>(null);
@@ -430,230 +467,237 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
       category: 'core',
     });
 
-    rawNodes.push({
-      id: 'domB',
-      label: domainB.domainName,
-      sublabel: domainB.source.toUpperCase(),
-      type: 'domainB',
-      category: 'core',
-    });
-
-    // CENTER HUBS: Shared Infrastructure
-    if (summary.sameAsn && domainA.asn) {
-      const id = 'shared_asn';
+    if (domainB && !isSingle) {
       rawNodes.push({
-        id,
-        label: domainA.asn,
-        sublabel: domainA.asnName || 'SHARED BGP ASN',
-        type: 'shared',
-        category: 'network',
+        id: 'domB',
+        label: domainB.domainName,
+        sublabel: domainB.source.toUpperCase(),
+        type: 'domainB',
+        category: 'core',
       });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'BGP' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'BGP' });
     }
 
-    if (summary.sameSubnet24 && domainA.subnet24) {
-      const id = 'shared_subnet';
-      rawNodes.push({
-        id,
-        label: domainA.subnet24,
-        sublabel: 'CO-LOCATED /24',
-        type: 'shared',
-        category: 'network',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: '/24' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: '/24' });
-    }
-
-    const setNsB = new Set(domainB.nameservers.map((s) => s.toLowerCase()));
-    const sharedNsList = domainA.nameservers.filter((s) => setNsB.has(s.toLowerCase()));
-    if (sharedNsList.length > 0) {
-      const id = 'shared_ns';
-      rawNodes.push({
-        id,
-        label: `${sharedNsList.length} Shared NS`,
-        sublabel: sharedNsList[0],
-        type: 'shared',
-        category: 'dns',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'DNS' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'DNS' });
-    }
-
-    if (summary.sameMailProvider && domainA.mailProvider && domainA.mailProvider !== 'No MX Records Listed') {
-      const id = 'shared_mail';
-      rawNodes.push({
-        id,
-        label: domainA.mailProvider.split('(')[0].trim(),
-        sublabel: 'SHARED MAIL MX',
-        type: 'shared',
-        category: 'mail',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'MX' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'MX' });
-    }
-
-    if (summary.sharedVerificationTokensCount > 0) {
-      const id = 'shared_tokens';
-      rawNodes.push({
-        id,
-        label: `${summary.sharedVerificationTokensCount} IDP Tokens`,
-        sublabel: 'SHARED TXT PROOF',
-        type: 'shared',
-        category: 'token',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'TXT' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'TXT' });
-    }
-
-    if (summary.sharedAnalyticsIds && summary.sharedAnalyticsIds.length > 0) {
-      const id = 'shared_analytics';
-      rawNodes.push({
-        id,
-        label: summary.sharedAnalyticsIds[0],
-        sublabel: 'SHARED ANALYTICS ID',
-        type: 'shared',
-        category: 'token',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'TAG' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'TAG' });
-    }
-
-    if (summary.sharedCopyrightEntities && summary.sharedCopyrightEntities.length > 0) {
-      const id = 'shared_copyright';
-      rawNodes.push({
-        id,
-        label: summary.sharedCopyrightEntities[0],
-        sublabel: 'SHARED COPYRIGHT HOLDER',
-        type: 'shared',
-        category: 'token',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: '©' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: '©' });
-    }
-
-    if (summary.sharedPassiveDnsIps && summary.sharedPassiveDnsIps.length > 0) {
-      const id = 'shared_pdns_ip';
-      rawNodes.push({
-        id,
-        label: summary.sharedPassiveDnsIps[0],
-        sublabel: 'SHARED PDNS IP',
-        type: 'shared',
-        category: 'network',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'PDNS' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'PDNS' });
-    }
-
-    if (summary.sharedExternalDomains && summary.sharedExternalDomains.length > 0) {
-      const id = 'shared_ext_domain';
-      rawNodes.push({
-        id,
-        label: summary.sharedExternalDomains[0],
-        sublabel: 'SHARED EXTERNAL ORIGIN',
-        type: 'shared',
-        category: 'dns',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'EXT' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'EXT' });
-    }
-
-    if (summary.sameTlsSubjectOrg && domainA.tlsSubjectOrg) {
-      const id = 'shared_tls_org';
-      rawNodes.push({
-        id,
-        label: domainA.tlsSubjectOrg,
-        sublabel: 'SSL SUBJECT ORG',
-        type: 'shared',
-        category: 'cert',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'TLS' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'TLS' });
-    }
-
-    if (summary.sharedPtrHostnames && summary.sharedPtrHostnames.length > 0) {
-      const id = 'shared_ptr';
-      rawNodes.push({
-        id,
-        label: summary.sharedPtrHostnames[0],
-        sublabel: 'SHARED PTR HOSTNAME',
-        type: 'shared',
-        category: 'network',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'PTR' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'PTR' });
-    }
-
-    if (summary.sharedSpfIps && summary.sharedSpfIps.length > 0) {
-      const id = 'shared_spf_ip';
-      rawNodes.push({
-        id,
-        label: summary.sharedSpfIps[0],
-        sublabel: 'SHARED SPF ORIGIN IP',
-        type: 'shared',
-        category: 'network',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'SPF' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'SPF' });
-    }
-
-    if (summary.sameSoaRname && domainA.soaRname) {
-      const id = 'shared_soa_rname';
-      rawNodes.push({
-        id,
-        label: domainA.soaRname,
-        sublabel: 'SHARED SOA RNAME',
-        type: 'shared',
-        category: 'dns',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'SOA' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'SOA' });
-    }
-
-    if ((summary.sameDmarcRua || summary.sameDmarcRuf) && (domainA.dmarcRuf || domainA.dmarcRua)) {
-      const id = 'shared_dmarc';
-      rawNodes.push({
-        id,
-        label: domainA.dmarcRuf || domainA.dmarcRua || '',
-        sublabel: 'SHARED DMARC REPORT',
-        type: 'shared',
-        category: 'mail',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'DMARC' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'DMARC' });
-    }
-
-    if (summary.sharedDkimTargets && summary.sharedDkimTargets.length > 0) {
-      const id = 'shared_dkim';
-      rawNodes.push({
-        id,
-        label: summary.sharedDkimTargets[0],
-        sublabel: 'SHARED DKIM TENANT',
-        type: 'shared',
-        category: 'mail',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'DKIM' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'DKIM' });
-    }
+    const setNsB = domainB ? new Set(domainB.nameservers.map((s) => s.toLowerCase())) : new Set<string>();
+    const sharedNsList = domainB && !isSingle
+      ? domainA.nameservers.filter((s) => setNsB.has(s.toLowerCase()))
+      : [];
 
     const isRedactedRegA = !domainA.registrar || domainA.registrar === 'Protected / Redacted';
-    const isSharedRegistrar = summary.sameRegistrar && !isRedactedRegA;
+    const isSharedRegistrar = Boolean(domainB && !isSingle && summary.sameRegistrar && !isRedactedRegA);
 
-    if (isSharedRegistrar) {
-      const id = 'shared_registrar';
-      rawNodes.push({
-        id,
-        label: domainA.registrar,
-        sublabel: 'SHARED REGISTRAR',
-        type: 'shared',
-        category: 'registrar',
-      });
-      linkList.push({ from: 'domA', to: id, isShared: true, label: 'REG' });
-      linkList.push({ from: 'domB', to: id, isShared: true, label: 'REG' });
+    if (domainB && !isSingle) {
+      // CENTER HUBS: Shared Infrastructure
+      if (summary.sameAsn && domainA.asn) {
+        const id = 'shared_asn';
+        rawNodes.push({
+          id,
+          label: domainA.asn,
+          sublabel: domainA.asnName || 'SHARED BGP ASN',
+          type: 'shared',
+          category: 'network',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'BGP' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'BGP' });
+      }
+
+      if (summary.sameSubnet24 && domainA.subnet24) {
+        const id = 'shared_subnet';
+        rawNodes.push({
+          id,
+          label: domainA.subnet24,
+          sublabel: 'CO-LOCATED /24',
+          type: 'shared',
+          category: 'network',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: '/24' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: '/24' });
+      }
+
+      if (sharedNsList.length > 0) {
+        const id = 'shared_ns';
+        rawNodes.push({
+          id,
+          label: `${sharedNsList.length} Shared NS`,
+          sublabel: sharedNsList[0],
+          type: 'shared',
+          category: 'dns',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'DNS' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'DNS' });
+      }
+
+      if (summary.sameMailProvider && domainA.mailProvider && domainA.mailProvider !== 'No MX Records Listed') {
+        const id = 'shared_mail';
+        rawNodes.push({
+          id,
+          label: domainA.mailProvider.split('(')[0].trim(),
+          sublabel: 'SHARED MAIL MX',
+          type: 'shared',
+          category: 'mail',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'MX' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'MX' });
+      }
+
+      if (summary.sharedVerificationTokensCount > 0) {
+        const id = 'shared_tokens';
+        rawNodes.push({
+          id,
+          label: `${summary.sharedVerificationTokensCount} IDP Tokens`,
+          sublabel: 'SHARED TXT PROOF',
+          type: 'shared',
+          category: 'token',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'TXT' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'TXT' });
+      }
+
+      if (summary.sharedAnalyticsIds && summary.sharedAnalyticsIds.length > 0) {
+        const id = 'shared_analytics';
+        rawNodes.push({
+          id,
+          label: summary.sharedAnalyticsIds[0],
+          sublabel: 'SHARED ANALYTICS ID',
+          type: 'shared',
+          category: 'token',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'TAG' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'TAG' });
+      }
+
+      if (summary.sharedCopyrightEntities && summary.sharedCopyrightEntities.length > 0) {
+        const id = 'shared_copyright';
+        rawNodes.push({
+          id,
+          label: summary.sharedCopyrightEntities[0],
+          sublabel: 'SHARED COPYRIGHT HOLDER',
+          type: 'shared',
+          category: 'token',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: '©' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: '©' });
+      }
+
+      if (summary.sharedPassiveDnsIps && summary.sharedPassiveDnsIps.length > 0) {
+        const id = 'shared_pdns_ip';
+        rawNodes.push({
+          id,
+          label: summary.sharedPassiveDnsIps[0],
+          sublabel: 'SHARED PDNS IP',
+          type: 'shared',
+          category: 'network',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'PDNS' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'PDNS' });
+      }
+
+      if (summary.sharedExternalDomains && summary.sharedExternalDomains.length > 0) {
+        const id = 'shared_ext_domain';
+        rawNodes.push({
+          id,
+          label: summary.sharedExternalDomains[0],
+          sublabel: 'SHARED EXTERNAL ORIGIN',
+          type: 'shared',
+          category: 'dns',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'EXT' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'EXT' });
+      }
+
+      if (summary.sameTlsSubjectOrg && domainA.tlsSubjectOrg) {
+        const id = 'shared_tls_org';
+        rawNodes.push({
+          id,
+          label: domainA.tlsSubjectOrg,
+          sublabel: 'SSL SUBJECT ORG',
+          type: 'shared',
+          category: 'cert',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'TLS' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'TLS' });
+      }
+
+      if (summary.sharedPtrHostnames && summary.sharedPtrHostnames.length > 0) {
+        const id = 'shared_ptr';
+        rawNodes.push({
+          id,
+          label: summary.sharedPtrHostnames[0],
+          sublabel: 'SHARED PTR HOSTNAME',
+          type: 'shared',
+          category: 'network',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'PTR' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'PTR' });
+      }
+
+      if (summary.sharedSpfIps && summary.sharedSpfIps.length > 0) {
+        const id = 'shared_spf_ip';
+        rawNodes.push({
+          id,
+          label: summary.sharedSpfIps[0],
+          sublabel: 'SHARED SPF ORIGIN IP',
+          type: 'shared',
+          category: 'network',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'SPF' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'SPF' });
+      }
+
+      if (summary.sameSoaRname && domainA.soaRname) {
+        const id = 'shared_soa_rname';
+        rawNodes.push({
+          id,
+          label: domainA.soaRname,
+          sublabel: 'SHARED SOA RNAME',
+          type: 'shared',
+          category: 'dns',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'SOA' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'SOA' });
+      }
+
+      if ((summary.sameDmarcRua || summary.sameDmarcRuf) && (domainA.dmarcRuf || domainA.dmarcRua)) {
+        const id = 'shared_dmarc';
+        rawNodes.push({
+          id,
+          label: domainA.dmarcRuf || domainA.dmarcRua || '',
+          sublabel: 'SHARED DMARC REPORT',
+          type: 'shared',
+          category: 'mail',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'DMARC' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'DMARC' });
+      }
+
+      if (summary.sharedDkimTargets && summary.sharedDkimTargets.length > 0) {
+        const id = 'shared_dkim';
+        rawNodes.push({
+          id,
+          label: summary.sharedDkimTargets[0],
+          sublabel: 'SHARED DKIM TENANT',
+          type: 'shared',
+          category: 'mail',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'DKIM' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'DKIM' });
+      }
+
+      if (isSharedRegistrar) {
+        const id = 'shared_registrar';
+        rawNodes.push({
+          id,
+          label: domainA.registrar,
+          sublabel: 'SHARED REGISTRAR',
+          type: 'shared',
+          category: 'registrar',
+        });
+        linkList.push({ from: 'domA', to: id, isShared: true, label: 'REG' });
+        linkList.push({ from: 'domB', to: id, isShared: true, label: 'REG' });
+      }
     }
 
-    // FLANKING NODES: Domain A Unique (Left Column)
-    if (!summary.sameAsn && domainA.asn) {
+    // FLANKING NODES: Domain A (Left Column in dual, Right-of-core in single)
+    if ((isSingle || !summary.sameAsn) && domainA.asn) {
       const id = 'asn_a';
       rawNodes.push({
         id,
@@ -663,6 +707,18 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
         category: 'network',
       });
       linkList.push({ from: 'domA', to: id, isShared: false, label: 'BGP' });
+    }
+
+    if (isSingle && domainA.subnet24) {
+      const id = 'subnet_a';
+      rawNodes.push({
+        id,
+        label: domainA.subnet24,
+        sublabel: domainA.aRecords[0] || 'IPv4 PREFIX',
+        type: 'uniqueA',
+        category: 'network',
+      });
+      linkList.push({ from: 'domA', to: id, isShared: false, label: '/24' });
     }
 
     if (!isSharedRegistrar && domainA.registrar) {
@@ -690,7 +746,7 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
       linkList.push({ from: 'domA', to: idNsA, isShared: false, label: 'DNS' });
     }
 
-    if (!summary.sameMailProvider && domainA.mailProvider && domainA.mailProvider !== 'No MX Records Listed') {
+    if ((isSingle || !summary.sameMailProvider) && domainA.mailProvider && domainA.mailProvider !== 'No MX Records Listed') {
       const idMailA = 'mail_a';
       rawNodes.push({
         id: idMailA,
@@ -702,61 +758,76 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
       linkList.push({ from: 'domA', to: idMailA, isShared: false, label: 'MX' });
     }
 
+    if (isSingle && domainA.tlsSubjectOrg) {
+      const idTlsA = 'tls_a';
+      rawNodes.push({
+        id: idTlsA,
+        label: domainA.tlsSubjectOrg,
+        sublabel: domainA.tlsIssuerOrg || 'TLS CERTIFICATE',
+        type: 'uniqueA',
+        category: 'cert',
+      });
+      linkList.push({ from: 'domA', to: idTlsA, isShared: false, label: 'TLS' });
+    }
+
     // FLANKING NODES: Domain B Unique (Right Column)
-    if (!summary.sameAsn && domainB.asn) {
-      const id = 'asn_b';
-      rawNodes.push({
-        id,
-        label: domainB.asn,
-        sublabel: domainB.asnName || 'UPSTREAM ASN',
-        type: 'uniqueB',
-        category: 'network',
-      });
-      linkList.push({ from: 'domB', to: id, isShared: false, label: 'BGP' });
-    }
+    if (domainB && !isSingle) {
+      if (!summary.sameAsn && domainB.asn) {
+        const id = 'asn_b';
+        rawNodes.push({
+          id,
+          label: domainB.asn,
+          sublabel: domainB.asnName || 'UPSTREAM ASN',
+          type: 'uniqueB',
+          category: 'network',
+        });
+        linkList.push({ from: 'domB', to: id, isShared: false, label: 'BGP' });
+      }
 
-    if (!isSharedRegistrar && domainB.registrar) {
-      const idRegB = 'reg_b';
-      rawNodes.push({
-        id: idRegB,
-        label: domainB.registrar,
-        sublabel: 'REGISTRAR',
-        type: 'uniqueB',
-        category: 'registrar',
-      });
-      linkList.push({ from: 'domB', to: idRegB, isShared: false, label: 'REG' });
-    }
+      if (!isSharedRegistrar && domainB.registrar) {
+        const idRegB = 'reg_b';
+        rawNodes.push({
+          id: idRegB,
+          label: domainB.registrar,
+          sublabel: 'REGISTRAR',
+          type: 'uniqueB',
+          category: 'registrar',
+        });
+        linkList.push({ from: 'domB', to: idRegB, isShared: false, label: 'REG' });
+      }
 
-    if (domainB.nameservers.length > 0 && !sharedNsLower.has(domainB.nameservers[0].toLowerCase())) {
-      const idNsB = 'ns_b';
-      rawNodes.push({
-        id: idNsB,
-        label: domainB.nameservers[0],
-        sublabel: domainB.dnsProvider || 'DNS CLUSTER',
-        type: 'uniqueB',
-        category: 'dns',
-      });
-      linkList.push({ from: 'domB', to: idNsB, isShared: false, label: 'DNS' });
-    }
+      if (domainB.nameservers.length > 0 && !sharedNsLower.has(domainB.nameservers[0].toLowerCase())) {
+        const idNsB = 'ns_b';
+        rawNodes.push({
+          id: idNsB,
+          label: domainB.nameservers[0],
+          sublabel: domainB.dnsProvider || 'DNS CLUSTER',
+          type: 'uniqueB',
+          category: 'dns',
+        });
+        linkList.push({ from: 'domB', to: idNsB, isShared: false, label: 'DNS' });
+      }
 
-    if (!summary.sameMailProvider && domainB.mailProvider && domainB.mailProvider !== 'No MX Records Listed') {
-      const idMailB = 'mail_b';
-      rawNodes.push({
-        id: idMailB,
-        label: domainB.mailProvider.split('(')[0].trim(),
-        sublabel: 'MAIL GATEWAY',
-        type: 'uniqueB',
-        category: 'mail',
-      });
-      linkList.push({ from: 'domB', to: idMailB, isShared: false, label: 'MX' });
+      if (!summary.sameMailProvider && domainB.mailProvider && domainB.mailProvider !== 'No MX Records Listed') {
+        const idMailB = 'mail_b';
+        rawNodes.push({
+          id: idMailB,
+          label: domainB.mailProvider.split('(')[0].trim(),
+          sublabel: 'MAIL GATEWAY',
+          type: 'uniqueB',
+          category: 'mail',
+        });
+        linkList.push({ from: 'domB', to: idMailB, isShared: false, label: 'MX' });
+      }
     }
 
     // Filter active nodes first so columns pack and center cleanly per filter
+    const effectiveFilter = isSingle && activeFilter === 'shared' ? 'all' : activeFilter;
     const visibleRaw = rawNodes.filter((n) => {
-      if (activeFilter === 'all') return true;
-      if (activeFilter === 'shared') return n.type === 'shared' || n.type === 'domainA' || n.type === 'domainB';
-      if (activeFilter === 'network') return n.category === 'network' || n.type === 'domainA' || n.type === 'domainB';
-      if (activeFilter === 'dns') return n.category === 'dns' || n.type === 'domainA' || n.type === 'domainB';
+      if (effectiveFilter === 'all') return true;
+      if (effectiveFilter === 'shared') return n.type === 'shared' || n.type === 'domainA' || n.type === 'domainB';
+      if (effectiveFilter === 'network') return n.category === 'network' || n.type === 'domainA' || n.type === 'domainB';
+      if (effectiveFilter === 'dns') return n.category === 'dns' || n.type === 'domainA' || n.type === 'domainB';
       return true;
     });
 
@@ -780,20 +851,25 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
       }));
     };
 
-    const positionedNodes: TopologyNode[] = [
-      ...placeColumn(colUniqueA, COL_X.uniqueA),
-      ...placeColumn(colDomA, COL_X.domainA),
-      ...placeColumn(colShared, COL_X.shared),
-      ...placeColumn(colDomB, COL_X.domainB),
-      ...placeColumn(colUniqueB, COL_X.uniqueB),
-    ];
+    const positionedNodes: TopologyNode[] = isSingle
+      ? [
+          ...placeColumn(colDomA, 345),
+          ...placeColumn(colUniqueA, 611),
+        ]
+      : [
+          ...placeColumn(colUniqueA, COL_X.uniqueA),
+          ...placeColumn(colDomA, COL_X.domainA),
+          ...placeColumn(colShared, COL_X.shared),
+          ...placeColumn(colDomB, COL_X.domainB),
+          ...placeColumn(colUniqueB, COL_X.uniqueB),
+        ];
 
     return {
       nodes: positionedNodes,
       links: linkList,
       canvasHeight: computedHeight,
     };
-  }, [domainA, domainB, summary, activeFilter]);
+  }, [domainA, domainB, summary, activeFilter, isSingle]);
 
   const selectedNode = useMemo(() => {
     return nodes.find((n) => n.id === selectedNodeId) || null;
@@ -852,10 +928,19 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
   }, [canvasHeight, viewportHeight, clampView]);
 
   useEffect(() => {
+    if (isSingle && activeFilter === 'shared') {
+      setActiveFilter('all');
+    }
     hasInteractedRef.current = false;
     setSelectedNodeId(null);
+    setPreviewOpen(false);
+    setPreviewCache({});
     centerView();
-  }, [domainA.domainName, domainB.domainName, activeFilter, centerView]);
+  }, [domainA.domainName, domainB?.domainName, isSingle, activeFilter, centerView]);
+
+  useEffect(() => {
+    setPreviewOpen(false);
+  }, [selectedNodeId]);
 
   useEffect(() => {
     if (!selectedNodeId) return;
@@ -890,7 +975,7 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
   useLayoutEffect(() => {
     if (!popupRef.current) return;
     setPopupHeight(popupRef.current.offsetHeight);
-  }, [popupDetails, vpSize]);
+  }, [popupDetails, vpSize, previewOpen, previewCache]);
 
   useEffect(() => {
     const el = viewportRef.current;
@@ -993,11 +1078,70 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
     setSelectedNodeId((prev) => (prev === node.id ? null : node.id));
   };
 
+  const isDomainNode = selectedNode?.id === 'domA' || selectedNode?.id === 'domB';
+
+  const handleTogglePreview = useCallback(async () => {
+    if (!selectedNode || (selectedNode.id !== 'domA' && selectedNode.id !== 'domB')) return;
+    if (previewOpen) {
+      setPreviewOpen(false);
+      return;
+    }
+
+    const domain = selectedNode.label.trim().toLowerCase();
+    setPreviewOpen(true);
+
+    const existing = previewCache[domain];
+    if (existing && (existing.loading || existing.html || existing.error)) {
+      return;
+    }
+
+    setPreviewCache((prev) => ({
+      ...prev,
+      [domain]: { loading: true },
+    }));
+
+    try {
+      const res = await fetch(`/api/preview?domain=${encodeURIComponent(domain)}`);
+      const data = await res.json();
+      if (!res.ok) {
+        setPreviewCache((prev) => ({
+          ...prev,
+          [domain]: {
+            loading: false,
+            error: data?.error || `Preview unavailable (HTTP ${res.status}).`,
+            statusCode: data?.statusCode,
+            finalUrl: data?.finalUrl,
+          },
+        }));
+        return;
+      }
+      setPreviewCache((prev) => ({
+        ...prev,
+        [domain]: {
+          loading: false,
+          html: data.html,
+          finalUrl: data.finalUrl,
+          statusCode: data.statusCode,
+        },
+      }));
+    } catch (err: any) {
+      setPreviewCache((prev) => ({
+        ...prev,
+        [domain]: {
+          loading: false,
+          error: err?.message || 'Unable to load website preview.',
+        },
+      }));
+    }
+  }, [selectedNode, previewOpen, previewCache]);
+
   const popupLayout = useMemo(() => {
     if (!selectedNode) return null;
     const widthVp = vpSize.width || 640;
     const heightVp = vpSize.height || viewportHeight;
-    const popupWidth = Math.min(340, Math.max(240, widthVp - POPUP_MARGIN * 2));
+    const targetMaxWidth = previewOpen && isDomainNode ? 540 : 340;
+    const targetMinWidth = previewOpen && isDomainNode ? 280 : 240;
+    const popupWidth = Math.min(targetMaxWidth, Math.max(targetMinWidth, widthVp - POPUP_MARGIN * 2));
     const maxHeight = Math.max(180, heightVp - POPUP_MARGIN * 2);
 
     const nodeLeft = view.x + selectedNode.x * view.zoom;
@@ -1038,7 +1182,7 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
       width: popupWidth,
       maxHeight,
     };
-  }, [selectedNode, vpSize, viewportHeight, view, popupHeight]);
+  }, [selectedNode, vpSize, viewportHeight, view, popupHeight, previewOpen, isDomainNode]);
 
   const popupBorderAccent = useMemo(() => {
     if (!selectedNode) return 'border-[#383838]';
@@ -1055,7 +1199,7 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
   }, [selectedNode]);
 
   return (
-    <div id="infrastructure-topology-map" className="bg-[#141414] border border-[#383838] rounded-none overflow-hidden flex flex-col relative mb-6">
+    <div id="infrastructure-topology-map" className="bg-[#141414] border border-[#383838] rounded-none overflow-hidden flex flex-col relative z-0 isolate mb-6">
       <div className="h-[2px] w-full bg-gradient-to-r from-[#c30800] via-[#c300bb] to-[#bbc300]" />
 
       {/* Minimal Control & Legend Toolbar */}
@@ -1063,7 +1207,7 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
         <div className="flex flex-wrap items-center gap-1.5">
           {[
             { id: 'all', label: 'All Nodes' },
-            { id: 'shared', label: 'Shared Hubs' },
+            ...(!isSingle ? [{ id: 'shared', label: 'Shared Hubs' }] : []),
             { id: 'network', label: 'BGP / Network' },
             { id: 'dns', label: 'DNS / Nameservers' },
           ].map((f) => (
@@ -1185,7 +1329,7 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
             </svg>
 
             {/* Empty Shared Column Indicator */}
-            {!hasSharedVisible && (
+            {!isSingle && !hasSharedVisible && (
               <div
                 style={{
                   position: 'absolute',
@@ -1292,9 +1436,9 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
               width: `${popupLayout.width}px`,
               maxHeight: `${popupLayout.maxHeight}px`,
             }}
-            className={`z-30 bg-[#141414]/95 backdrop-blur-xs border ${popupBorderAccent} shadow-2xl flex flex-col rounded-none select-text cursor-auto`}
+            className={`z-20 bg-[#141414]/95 backdrop-blur-xs border ${popupBorderAccent} shadow-2xl flex flex-col rounded-none select-text cursor-auto`}
           >
-            <div className="px-3 py-2 bg-[#1a1a1a] border-b border-[#2e2e2e] shrink-0">
+            <div className="px-3 py-2 bg-[#1a1a1a] border-b border-[#2e2e2e] flex items-start justify-between gap-2 shrink-0">
               <div className="min-w-0">
                 <div className={`text-[9px] font-mono uppercase tracking-wider font-bold truncate ${popupBadgeAccent}`}>
                   {popupDetails.badge}
@@ -1308,10 +1452,98 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
                   </div>
                 )}
               </div>
+              {isDomainNode && (
+                <button
+                  type="button"
+                  onClick={handleTogglePreview}
+                  className="px-2 py-1 text-[10px] font-mono uppercase tracking-wider border border-[#383838] bg-[#141414] hover:bg-[#262626] text-[#f0f0f0] transition-colors rounded-none cursor-pointer font-semibold shrink-0"
+                >
+                  {previewOpen ? 'DETAILS' : 'PREVIEW'}
+                </button>
+              )}
             </div>
 
             <div className="p-3 overflow-y-auto custom-scrollbar space-y-2 text-[11px] font-mono">
-              {popupDetails.rows.length > 0 ? (
+              {previewOpen && isDomainNode ? (
+                (() => {
+                  const domainKey = selectedNode.label.trim().toLowerCase();
+                  const previewState = previewCache[domainKey];
+                  const innerWidth = Math.max(220, popupLayout.width - 24);
+                  const virtualWidth = 1280;
+                  const virtualHeight = 1600;
+                  const scale = innerWidth / virtualWidth;
+                  const frameMaxH = Math.max(150, popupLayout.maxHeight - 108);
+
+                  if (!previewState || previewState.loading) {
+                    return (
+                      <div className="py-8 px-3 border border-[#2e2e2e] bg-[#0d0d0d] flex flex-col items-center justify-center text-center text-[#8c8c8c] text-[11px] uppercase tracking-wider">
+                        <CustomSpinner className="w-8 h-8 text-[#c30800] mb-2.5" />
+                        <span>LOADING STATIC PREVIEW...</span>
+                      </div>
+                    );
+                  }
+
+                  if (previewState.error) {
+                    return (
+                      <div className="p-3 border border-[#c3005a]/50 bg-[#0d0d0d] text-[#f0f0f0] text-[11px] break-words">
+                        <div className="text-[9px] uppercase tracking-wider font-bold text-[#c3005a] mb-1">
+                          PREVIEW UNAVAILABLE
+                        </div>
+                        {previewState.error}
+                      </div>
+                    );
+                  }
+
+                  if (!previewState.html) {
+                    return (
+                      <div className="p-3 border border-[#2e2e2e] bg-[#0d0d0d] text-[#8c8c8c] text-[11px]">
+                        No preview markup available.
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between gap-2 text-[9px] uppercase tracking-wider text-[#8c8c8c]">
+                        <span className="truncate">
+                          {previewState.finalUrl || selectedNode.label}
+                        </span>
+                        <span className="shrink-0">
+                          {previewState.statusCode ? `HTTP ${previewState.statusCode} // ` : ''}NO-JS SANDBOX
+                        </span>
+                      </div>
+                      <div
+                        style={{ maxHeight: `${frameMaxH}px` }}
+                        className="overflow-y-auto overflow-x-hidden custom-scrollbar border border-[#2e2e2e] bg-white"
+                      >
+                        <div
+                          style={{
+                            width: `${innerWidth}px`,
+                            height: `${Math.round(virtualHeight * scale)}px`,
+                            overflow: 'hidden',
+                            position: 'relative',
+                          }}
+                        >
+                          <iframe
+                            sandbox=""
+                            referrerPolicy="no-referrer"
+                            title={`Static preview of ${selectedNode.label}`}
+                            srcDoc={previewState.html}
+                            style={{
+                              width: `${virtualWidth}px`,
+                              height: `${virtualHeight}px`,
+                              transform: `scale(${scale})`,
+                              transformOrigin: '0 0',
+                              border: 0,
+                            }}
+                            className="block bg-white pointer-events-none"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : popupDetails.rows.length > 0 ? (
                 popupDetails.rows.map((row, idx) => (
                   <div
                     key={`${row.label}-${idx}`}

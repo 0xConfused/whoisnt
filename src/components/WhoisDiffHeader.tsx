@@ -125,6 +125,18 @@ export const WhoisDiffHeader: React.FC<WhoisDiffHeaderProps> = ({
                     {domainB}
                   </span>
                 </span>
+              ) : domainA || domainB ? (
+                <span className="flex items-center gap-1.5 text-[#f0f0f0] min-w-0">
+                  <span className="text-[#8c8c8c]">TARGET:</span>
+                  <span
+                    className={`text-[#f0f0f0] font-bold underline truncate max-w-[220px] sm:max-w-sm ${
+                      domainA ? 'decoration-[#c30800]' : 'decoration-[#c300bb]'
+                    }`}
+                    title={domainA || domainB}
+                  >
+                    {domainA || domainB}
+                  </span>
+                </span>
               ) : (
                 'Authoritative WHOIS, Reverse Pivots & Certificate Intelligence Engine'
               )}

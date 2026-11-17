@@ -4,8 +4,6 @@ import React, { useState, useMemo } from 'react';
 import { WhoisDiffResult } from '../types';
 import {
   Search,
-  Copy,
-  Check,
   Table as TableIcon,
   Columns,
 } from 'lucide-react';
@@ -30,19 +28,11 @@ const ARCHETYPE_PATTERNS: Record<
 
 export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProps> = ({ diff }) => {
   const { domainA, domainB } = diff;
+  const isSingle = Boolean(diff.isSingleDomain || !domainB);
 
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedArchetype, setSelectedArchetype] = useState<ArchetypeCategory>('all');
   const [layoutMode, setLayoutMode] = useState<LayoutMode>('tri_panel');
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
-
-  const handleCopy = (items: string[], key: string) => {
-    try {
-      navigator.clipboard.writeText(items.join('\n'));
-      setCopiedKey(key);
-      setTimeout(() => setCopiedKey(null), 1800);
-    } catch {}
-  };
 
   const getSubdomainPrefix = (sub: string, root: string) => {
     const cleanSub = sub.toLowerCase().replace(/^\*\./, '').trim();
@@ -66,14 +56,29 @@ export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProp
 
   const { uniqueA, sharedArchetypes, uniqueB } = useMemo(() => {
     const subsA = domainA.crtSubdomainsSample || [];
-    const subsB = domainB.crtSubdomainsSample || [];
-
     const mapA = new Map<string, string>(); // prefix -> full subdomain
     subsA.forEach((s) => {
       const p = getSubdomainPrefix(s, domainA.rootDomain);
       if (p !== '@') mapA.set(p, s);
     });
 
+    if (!domainB || isSingle) {
+      const onlyA: Array<{ prefix: string; full: string; category: Exclude<ArchetypeCategory, 'all'> }> = [];
+      mapA.forEach((full, prefix) => {
+        onlyA.push({
+          prefix,
+          full,
+          category: classifySubdomain(prefix),
+        });
+      });
+      return {
+        uniqueA: onlyA,
+        sharedArchetypes: [],
+        uniqueB: [],
+      };
+    }
+
+    const subsB = domainB.crtSubdomainsSample || [];
     const mapB = new Map<string, string>(); // prefix -> full subdomain
     subsB.forEach((s) => {
       const p = getSubdomainPrefix(s, domainB.rootDomain);
@@ -122,7 +127,7 @@ export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProp
       sharedArchetypes: sharedKeys,
       uniqueB: uniqueListB,
     };
-  }, [domainA, domainB]);
+  }, [domainA, domainB, isSingle]);
 
   // Apply filters
   const filterList = <T extends { prefix: string; category: string }>(items: T[]): T[] => {
@@ -176,20 +181,22 @@ export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProp
       });
     });
 
-    filteredUniqueB.forEach((item, idx) => {
-      rows.push({
-        id: `uniqB_${idx}`,
-        host: item.full,
-        domainKey: 'B',
-        domainLabel: domainB.domainName,
-        prefix: item.prefix,
-        category: item.category,
-        isShared: false,
+    if (domainB && !isSingle) {
+      filteredUniqueB.forEach((item, idx) => {
+        rows.push({
+          id: `uniqB_${idx}`,
+          host: item.full,
+          domainKey: 'B',
+          domainLabel: domainB.domainName,
+          prefix: item.prefix,
+          category: item.category,
+          isShared: false,
+        });
       });
-    });
+    }
 
     return rows.sort((a, b) => a.prefix.localeCompare(b.prefix));
-  }, [filteredShared, filteredUniqueA, filteredUniqueB, domainA.domainName, domainB.domainName]);
+  }, [filteredShared, filteredUniqueA, filteredUniqueB, domainA.domainName, domainB, isSingle]);
 
   const totalFilteredCount = filteredShared.length + filteredUniqueA.length + filteredUniqueB.length;
 
@@ -237,7 +244,7 @@ export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProp
             maxLength={200}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Filter subdomains..."
+            placeholder="Filter subdomains"
             className="w-full pl-8 pr-3 py-1 bg-[#141414] border border-[#2e2e2e] hover:border-[#383838] rounded-none text-xs text-[#f0f0f0] placeholder-[#737373] focus:outline-none focus:border-[#c30800]/60 font-mono transition-colors"
           />
         </div>
@@ -272,32 +279,32 @@ export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProp
 
       {/* Main Content Area: Tri-Panel or Table Mode */}
       {layoutMode === 'tri_panel' ? (
-        <div className="grid grid-cols-1 lg:grid-cols-3 divide-y lg:divide-y-0 lg:divide-x divide-[#383838] bg-[#0d0d0d]">
-          {/* Panel 1: Unique to Domain A */}
+        <div
+          className={
+            isSingle
+              ? 'grid grid-cols-1 bg-[#0d0d0d]'
+              : 'grid grid-cols-1 lg:grid-cols-3 divide-y lg:divide-y-0 lg:divide-x divide-[#383838] bg-[#0d0d0d]'
+          }
+        >
+          {/* Panel 1: Domain A */}
           <div className="flex flex-col">
             <div className="px-3 py-2 bg-[#141414] border-b border-[#2e2e2e] flex items-center justify-between text-xs font-mono border-t-2 border-t-[#c30800]">
-              <div className="min-w-0 pr-2">
+              <div className="min-w-0">
                 <span className="text-[#c30800] font-bold block truncate" title={domainA.domainName}>
                   {domainA.domainName}
                 </span>
                 <span className="text-[10px] text-[#737373]">
-                  {filteredUniqueA.length} unique
+                  {filteredUniqueA.length} {isSingle ? 'observed' : 'unique'}
                 </span>
               </div>
-              <button
-                type="button"
-                onClick={() => handleCopy(filteredUniqueA.map((i) => i.full), 'uniqA')}
-                className="px-2 py-0.5 text-[10px] font-mono border border-[#383838] bg-[#141414] hover:bg-[#262626] text-[#8c8c8c] hover:text-[#f0f0f0] transition-colors rounded-none cursor-pointer flex items-center gap-1 shrink-0"
-              >
-                {copiedKey === 'uniqA' ? <Check className="w-2.5 h-2.5 text-[#bbc300]" /> : <Copy className="w-2.5 h-2.5" />}
-                <span>{copiedKey === 'uniqA' ? 'COPIED' : 'COPY'}</span>
-              </button>
             </div>
 
             <div className="overflow-y-auto max-h-[480px] custom-scrollbar divide-y divide-[#2e2e2e]/50">
               {filteredUniqueA.length === 0 ? (
                 <div className="py-8 text-center text-[#737373] font-mono text-xs">
-                  No unique subdomains matching active filter.
+                  {isSingle
+                    ? 'No subdomains matching active filter.'
+                    : 'No unique subdomains matching active filter.'}
                 </div>
               ) : (
                 filteredUniqueA.map((item, idx) => (
@@ -316,96 +323,84 @@ export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProp
           </div>
 
           {/* Panel 2: Shared Archetypes */}
-          <div className="flex flex-col">
-            <div className="px-3 py-2 bg-[#141414] border-b border-[#2e2e2e] flex items-center justify-between text-xs font-mono border-t-2 border-t-[#bbc300]">
-              <div className="min-w-0 pr-2">
-                <span className="text-[#bbc300] font-bold block truncate">
-                  SHARED ARCHETYPES
-                </span>
-                <span className="text-[10px] text-[#737373]">
-                  {filteredShared.length} shared
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => handleCopy(filteredShared.map((i) => `${i.prefix} (A: ${i.fullA} | B: ${i.fullB})`), 'shared')}
-                className="px-2 py-0.5 text-[10px] font-mono border border-[#383838] bg-[#141414] hover:bg-[#262626] text-[#8c8c8c] hover:text-[#f0f0f0] transition-colors rounded-none cursor-pointer flex items-center gap-1 shrink-0"
-              >
-                {copiedKey === 'shared' ? <Check className="w-2.5 h-2.5 text-[#bbc300]" /> : <Copy className="w-2.5 h-2.5" />}
-                <span>{copiedKey === 'shared' ? 'COPIED' : 'COPY'}</span>
-              </button>
-            </div>
-
-            <div className="overflow-y-auto max-h-[480px] custom-scrollbar divide-y divide-[#2e2e2e]/50">
-              {filteredShared.length === 0 ? (
-                <div className="py-8 text-center text-[#737373] font-mono text-xs">
-                  No common subdomain naming archetypes identified between targets.
+          {!isSingle && domainB && (
+            <div className="flex flex-col">
+              <div className="px-3 py-2 bg-[#141414] border-b border-[#2e2e2e] flex items-center justify-between text-xs font-mono border-t-2 border-t-[#bbc300]">
+                <div className="min-w-0">
+                  <span className="text-[#bbc300] font-bold block truncate">
+                    SHARED ARCHETYPES
+                  </span>
+                  <span className="text-[10px] text-[#737373]">
+                    {filteredShared.length} shared
+                  </span>
                 </div>
-              ) : (
-                filteredShared.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className="px-3 py-2 hover:bg-[#141414] transition-colors flex flex-col gap-0.5 text-xs font-mono"
-                  >
-                    <div className="flex items-center justify-between gap-1">
-                      <span className="font-bold text-[#bbc300]">
-                        {item.prefix}
-                      </span>
+              </div>
+
+              <div className="overflow-y-auto max-h-[480px] custom-scrollbar divide-y divide-[#2e2e2e]/50">
+                {filteredShared.length === 0 ? (
+                  <div className="py-8 text-center text-[#737373] font-mono text-xs">
+                    No common subdomain naming archetypes identified between targets.
+                  </div>
+                ) : (
+                  filteredShared.map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="px-3 py-2 hover:bg-[#141414] transition-colors flex flex-col gap-0.5 text-xs font-mono"
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="font-bold text-[#bbc300]">
+                          {item.prefix}
+                        </span>
+                        <span className="text-[9px] font-mono text-[#737373] shrink-0 uppercase">
+                          {item.category}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-[#8c8c8c] flex flex-col gap-0.5 pl-2 border-l border-[#2e2e2e]">
+                        <span className="truncate text-[#f0f0f0]">{item.fullA}</span>
+                        <span className="truncate text-[#f0f0f0]">{item.fullB}</span>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Panel 3: Unique to Domain B */}
+          {!isSingle && domainB && (
+            <div className="flex flex-col">
+              <div className="px-3 py-2 bg-[#141414] border-b border-[#2e2e2e] flex items-center justify-between text-xs font-mono border-t-2 border-t-[#c300bb]">
+                <div className="min-w-0">
+                  <span className="text-[#c300bb] font-bold block truncate" title={domainB.domainName}>
+                    {domainB.domainName}
+                  </span>
+                  <span className="text-[10px] text-[#737373]">
+                    {filteredUniqueB.length} unique
+                  </span>
+                </div>
+              </div>
+
+              <div className="overflow-y-auto max-h-[480px] custom-scrollbar divide-y divide-[#2e2e2e]/50">
+                {filteredUniqueB.length === 0 ? (
+                  <div className="py-8 text-center text-[#737373] font-mono text-xs">
+                    No unique subdomains matching active filter.
+                  </div>
+                ) : (
+                  filteredUniqueB.map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="px-3 py-1.5 hover:bg-[#141414] transition-colors flex items-center justify-between gap-2 text-xs font-mono"
+                    >
+                      <span className="text-[#f0f0f0] truncate select-all">{item.full}</span>
                       <span className="text-[9px] font-mono text-[#737373] shrink-0 uppercase">
                         {item.category}
                       </span>
                     </div>
-                    <div className="text-[11px] text-[#8c8c8c] flex flex-col gap-0.5 pl-2 border-l border-[#2e2e2e]">
-                      <span className="truncate text-[#f0f0f0]">{item.fullA}</span>
-                      <span className="truncate text-[#f0f0f0]">{item.fullB}</span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-
-          {/* Panel 3: Unique to Domain B */}
-          <div className="flex flex-col">
-            <div className="px-3 py-2 bg-[#141414] border-b border-[#2e2e2e] flex items-center justify-between text-xs font-mono border-t-2 border-t-[#c300bb]">
-              <div className="min-w-0 pr-2">
-                <span className="text-[#c300bb] font-bold block truncate" title={domainB.domainName}>
-                  {domainB.domainName}
-                </span>
-                <span className="text-[10px] text-[#737373]">
-                  {filteredUniqueB.length} unique
-                </span>
+                  ))
+                )}
               </div>
-              <button
-                type="button"
-                onClick={() => handleCopy(filteredUniqueB.map((i) => i.full), 'uniqB')}
-                className="px-2 py-0.5 text-[10px] font-mono border border-[#383838] bg-[#141414] hover:bg-[#262626] text-[#8c8c8c] hover:text-[#f0f0f0] transition-colors rounded-none cursor-pointer flex items-center gap-1 shrink-0"
-              >
-                {copiedKey === 'uniqB' ? <Check className="w-2.5 h-2.5 text-[#bbc300]" /> : <Copy className="w-2.5 h-2.5" />}
-                <span>{copiedKey === 'uniqB' ? 'COPIED' : 'COPY'}</span>
-              </button>
             </div>
-
-            <div className="overflow-y-auto max-h-[480px] custom-scrollbar divide-y divide-[#2e2e2e]/50">
-              {filteredUniqueB.length === 0 ? (
-                <div className="py-8 text-center text-[#737373] font-mono text-xs">
-                  No unique subdomains matching active filter.
-                </div>
-              ) : (
-                filteredUniqueB.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className="px-3 py-1.5 hover:bg-[#141414] transition-colors flex items-center justify-between gap-2 text-xs font-mono"
-                  >
-                    <span className="text-[#f0f0f0] truncate select-all">{item.full}</span>
-                    <span className="text-[9px] font-mono text-[#737373] shrink-0 uppercase">
-                      {item.category}
-                    </span>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
+          )}
         </div>
       ) : (
         /* Unified Table Mode matching DirectoryTableView.tsx */
@@ -418,21 +413,18 @@ export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProp
                 <th className="py-2.5 px-4 font-semibold w-40">Prefix</th>
                 <th className="py-2.5 px-4 font-semibold w-36">Archetype</th>
                 <th className="py-2.5 px-4 font-semibold w-32">Status</th>
-                <th className="py-2.5 px-3 text-right font-semibold w-20">Action</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#2e2e2e]">
               {unifiedTableRows.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="py-12 text-center text-[#737373] font-mono text-xs">
+                  <td colSpan={5} className="py-12 text-center text-[#737373] font-mono text-xs">
                     No Certificate Transparency hosts match search criteria.
                   </td>
                 </tr>
               ) : (
-                unifiedTableRows.map((row) => {
-                  const isCopied = copiedKey === row.id;
-                  return (
-                    <tr key={row.id} className="hover:bg-[#1a1a1a]/80 transition-colors group cursor-pointer">
+                unifiedTableRows.map((row) => (
+                    <tr key={row.id} className="hover:bg-[#1a1a1a]/80 transition-colors group">
                       <td className="py-2.5 px-4 align-middle">
                         <span className="flex items-center font-bold">
                           <span
@@ -466,23 +458,12 @@ export const OsintSubdomainIntersection: React.FC<OsintSubdomainIntersectionProp
                           </span>
                         ) : (
                           <span className="text-xs font-mono text-[#737373]">
-                            EXCLUSIVE
+                            {isSingle ? 'OBSERVED' : 'EXCLUSIVE'}
                           </span>
                         )}
                       </td>
-                      <td className="py-2.5 px-3 text-right align-middle">
-                        <button
-                          type="button"
-                          onClick={() => handleCopy([row.host], row.id)}
-                          className="px-2 py-0.5 text-[10px] font-mono border border-[#383838] bg-[#141414] hover:bg-[#262626] text-[#8c8c8c] hover:text-[#f0f0f0] transition-colors rounded-none cursor-pointer inline-flex items-center gap-1"
-                        >
-                          {isCopied ? <Check className="w-2.5 h-2.5 text-[#bbc300]" /> : <Copy className="w-2.5 h-2.5" />}
-                          <span>{isCopied ? 'COPIED' : 'COPY'}</span>
-                        </button>
-                      </td>
                     </tr>
-                  );
-                })
+                ))
               )}
             </tbody>
           </table>
