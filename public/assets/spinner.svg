@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" xmlns:bx="https://boxy-svg.com">
+  <ellipse style="paint-order: fill; stroke-width: 31px; fill: none; stroke: rgb(0, 0, 0);" cx="262.267" cy="256.691" rx="216.861" ry="216.861" id="object-1"></ellipse>
+  <ellipse style="fill: none; stroke: rgb(0, 0, 0); stroke-width: 21px;" cx="143.988" cy="225.816" rx="30.672" ry="30.672" id="object-2"></ellipse>
+  <ellipse style="fill: none; stroke: rgb(0, 0, 0); stroke-width: 21px;" cx="233.844" cy="186.936" rx="30.672" ry="30.672" id="object-3"></ellipse>
+  <ellipse style="fill: none; stroke: rgb(0, 0, 0); stroke-width: 21px;" cx="323.7" cy="149.784" rx="30.672" ry="30.672" id="object-4"></ellipse>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 248.532 223.224 L 284.82 307.463" id="object-5"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px; transform-origin: 273.156px 277.223px 0px;" d="M 184.79 315.191 L 362.02 238.993" transform="matrix(-1, 0, 0, -1, 0.000012, -0.000016)" id="object-0"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 157.812 256.704 L 182.868 315.455" id="object-6"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 336.228 179.16 L 361.284 237.911" id="object-7"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 251.988 331.224 L 271.465 377.719" id="object-8"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 325.07 299.04 L 345.732 346.127" id="object-9"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 252.543 329.823 L 324.243 299.039" id="object-10"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 272.199 378.152 L 345.084 346.775" id="object-11"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 309.241 363.316 L 321.213 392.233" id="object-12"></path>
+  <path style="fill: none; stroke: rgb(0, 0, 0); stroke-linecap: round; stroke-width: 22px;" d="M 299.563 401.827 L 343.924 382.754" id="object-13"></path>
+</svg>

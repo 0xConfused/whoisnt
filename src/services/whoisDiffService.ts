@@ -2377,12 +2377,22 @@ async function fetchClientPassiveDns(
   pdnsQueriedSubdomainsCount: number;
 }> {
   const ipSet = new Set<string>();
-  const displaySet = new Set<string>();
+  const displayMap = new Map<string, string>();
+  const addPdnsDisplay = (rr: string, host: string, ans: string) => {
+    const cleanRr = rr.toUpperCase().trim();
+    const cleanHost = host.toLowerCase().trim().replace(/\.$/, '');
+    const cleanAns = ans.trim();
+    if (!cleanRr || !cleanHost || !cleanAns) return;
+    const key = `${cleanRr}|${cleanHost}|${cleanAns.toLowerCase()}`;
+    if (!displayMap.has(key)) {
+      displayMap.set(key, `${cleanRr} | ${cleanHost} -> ${cleanAns}`);
+    }
+  };
 
   for (const rec of preloadedHtRecords) {
     if (!rec.host || !rec.ip) continue;
     if (/^[\da-fA-F:.]+$/.test(rec.ip)) ipSet.add(rec.ip);
-    displaySet.add(`${rec.ip.includes(':') ? 'AAAA' : 'A'} | ${rec.host} -> ${rec.ip}`);
+    addPdnsDisplay(rec.ip.includes(':') ? 'AAAA' : 'A', rec.host, rec.ip);
   }
 
   const queryHackerTarget = async () => {
@@ -2404,7 +2414,7 @@ async function fetchClientPassiveDns(
         const ip = ipRaw?.trim();
         if (!host || !ip) continue;
         if (/^[\da-fA-F:.]+$/.test(ip)) ipSet.add(ip);
-        displaySet.add(`${ip.includes(':') ? 'AAAA' : 'A'} | ${host} -> ${ip}`);
+        addPdnsDisplay(ip.includes(':') ? 'AAAA' : 'A', host, ip);
       }
     } catch {}
   };
@@ -2430,7 +2440,7 @@ async function fetchClientPassiveDns(
             const ans = String(rawAns).trim();
             if (!ans) continue;
             if (/^[\da-fA-F:.]+$/.test(ans)) ipSet.add(ans);
-            displaySet.add(`${ans.includes(':') ? 'AAAA' : 'A'} | ${hostKey.toLowerCase()} -> ${ans}`);
+            addPdnsDisplay(ans.includes(':') ? 'AAAA' : 'A', hostKey, ans);
           }
         }
       }
@@ -2452,10 +2462,25 @@ async function fetchClientPassiveDns(
   await Promise.all([queryHackerTarget(), queryRipeBatched()]);
 
   return {
-    passiveDnsDisplay: Array.from(displaySet).sort().slice(0, 250),
+    passiveDnsDisplay: Array.from(displayMap.values()).sort().slice(0, 250),
     passiveDnsIps: Array.from(ipSet).sort(),
     pdnsQueriedSubdomainsCount: pdnsTargets.length,
   };
+}
+
+function normalizeFinalUrlForDedup(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    u.hash = '';
+    u.hostname = u.hostname.toLowerCase();
+    if ((u.protocol === 'https:' && u.port === '443') || (u.protocol === 'http:' && u.port === '80')) {
+      u.port = '';
+    }
+    if (!u.pathname) u.pathname = '/';
+    return u.toString();
+  } catch {
+    return rawUrl.trim().toLowerCase();
+  }
 }
 
 /**
@@ -2466,6 +2491,7 @@ async function fetchClientPassiveDns(
 async function probeClientWebPageAndHeaders(cleanDomain: string, discoveredSubs: string[] = []) {
   const candidates = prioritizeSubdomainsForRecon(cleanDomain, discoveredSubs, 8);
   const seenFinalUrls = new Set<string>();
+  const seenScriptUrls = new Set<string>();
   const entries: SubdomainWebProbeEntry[] = [];
   let totalScriptFetches = 0;
   const deadline = Date.now() + 7000;
@@ -2487,9 +2513,10 @@ async function probeClientWebPageAndHeaders(cleanDomain: string, discoveredSubs:
 
       const sanitizedHeaders = sanitizeHttpHeaders(res.headers);
       const finalUrl = res.url || targetUrl;
+      const dedupFinalUrl = normalizeFinalUrlForDedup(finalUrl);
       const serverHeader = sanitizedHeaders['server'] || undefined;
 
-      if (seenFinalUrls.has(finalUrl)) {
+      if (seenFinalUrls.has(dedupFinalUrl)) {
         entries.push({
           host,
           httpWebServer: serverHeader,
@@ -2501,7 +2528,7 @@ async function probeClientWebPageAndHeaders(cleanDomain: string, discoveredSubs:
         } catch {}
         return;
       }
-      seenFinalUrls.add(finalUrl);
+      seenFinalUrls.add(dedupFinalUrl);
 
       const htmlText = await readBoundedResponseText(res, MAX_HTML_RECON_BYTES);
       const recon = analyzeHtmlRecon(htmlText, finalUrl, sanitizedHeaders, host);
@@ -2509,7 +2536,14 @@ async function probeClientWebPageAndHeaders(cleanDomain: string, discoveredSubs:
       let inspectedScriptsCount = 0;
       if (totalScriptFetches < 6 && Date.now() < deadline) {
         const remainingScripts = Math.min(2, 6 - totalScriptFetches);
-        const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, host, remainingScripts);
+        const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, host, remainingScripts * 2)
+          .filter((sUrl) => {
+            const normScript = normalizeFinalUrlForDedup(sUrl);
+            if (seenScriptUrls.has(normScript)) return false;
+            seenScriptUrls.add(normScript);
+            return true;
+          })
+          .slice(0, remainingScripts);
         totalScriptFetches += candidateScripts.length;
 
         if (candidateScripts.length > 0) {

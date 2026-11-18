@@ -132,10 +132,6 @@ const HIGH_SIGNAL_WEB_PREFIXES = new Set([
   'm', 'mobile', 'en', 'us',
 ]);
 
-const FALLBACK_COMMON_PREFIXES = [
-  'www', 'app', 'api', 'blog', 'docs', 'shop', 'support', 'status', 'mail', 'portal',
-];
-
 export function prioritizeSubdomainsForRecon(
   rootDomain: string,
   discovered: string[],
@@ -158,17 +154,9 @@ export function prioritizeSubdomainsForRecon(
   };
 
   tryCollect(apex);
-  tryCollect(`www.${apex}`);
 
   for (const item of discovered) {
     tryCollect(item);
-  }
-
-  // If discovery returned no subdomains besides apex/www, seed common standard subdomains
-  if (validSubs.length <= 2) {
-    for (const prefix of FALLBACK_COMMON_PREFIXES) {
-      tryCollect(`${prefix}.${apex}`);
-    }
   }
 
   const scoreHost = (host: string): number => {

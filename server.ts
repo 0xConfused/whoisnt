@@ -1201,11 +1201,27 @@ async function extractAttributionAndVerification(domain: string): Promise<{
   };
 }
 
+function normalizeFinalUrlForDedup(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    u.hash = '';
+    u.hostname = u.hostname.toLowerCase();
+    if ((u.protocol === 'https:' && u.port === '443') || (u.protocol === 'http:' && u.port === '80')) {
+      u.port = '';
+    }
+    if (!u.pathname) u.pathname = '/';
+    return u.toString();
+  } catch {
+    return rawUrl.trim().toLowerCase();
+  }
+}
+
 async function probeSingleHostWebRecon(
   host: string,
   userAgent: string,
   allowHttpFallback: boolean,
   seenFinalUrls: Set<string>,
+  seenScriptUrls: Set<string>,
   scriptBudget: { remaining: number }
 ): Promise<SubdomainWebProbeEntry | null> {
   if (!isValidDomainFormat(host) || isPrivateOrLocalHost(host)) return null;
@@ -1239,6 +1255,7 @@ async function probeSingleHostWebRecon(
   if (!res) return null;
 
   const finalUrl = ((res as any).finalUrl as string) || res.url || attemptUrl;
+  const dedupFinalUrl = normalizeFinalUrlForDedup(finalUrl);
   const sanitizedHeaders = sanitizeHttpHeaders(res.headers);
   const serverHeader = sanitizedHeaders['server'] || undefined;
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
@@ -1255,7 +1272,7 @@ async function probeSingleHostWebRecon(
     .sort()
     .map((k) => `${k}: ${sanitizedHeaders[k]}`);
 
-  if (!isHtmlLike || seenFinalUrls.has(finalUrl)) {
+  if (!isHtmlLike || seenFinalUrls.has(dedupFinalUrl)) {
     try {
       await res.body?.cancel();
     } catch {}
@@ -1267,7 +1284,7 @@ async function probeSingleHostWebRecon(
       fallbackHeaders: httpHeaderSummary,
     };
   }
-  seenFinalUrls.add(finalUrl);
+  seenFinalUrls.add(dedupFinalUrl);
 
   let htmlText = '';
   try {
@@ -1278,13 +1295,20 @@ async function probeSingleHostWebRecon(
 
   const recon = analyzeHtmlRecon(htmlText, finalUrl, sanitizedHeaders, host);
 
-  // Bounded first-party script UTF-8 text scan (strictly non-executed, SSRF-guarded)
+  // Bounded first-party script UTF-8 text scan (strictly non-executed, SSRF-guarded, deduplicated across hosts)
   const analyticsSet = new Set<string>(recon.analyticsIds);
   let inspectedScriptsCount = 0;
 
   if (scriptBudget.remaining > 0) {
     const allowedForHost = Math.min(2, scriptBudget.remaining);
-    const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, host, allowedForHost);
+    const candidateScripts = selectFirstPartyScriptsForInspection(recon.scriptUrls, host, allowedForHost * 2)
+      .filter((scriptUrl) => {
+        const normScript = normalizeFinalUrlForDedup(scriptUrl);
+        if (seenScriptUrls.has(normScript)) return false;
+        seenScriptUrls.add(normScript);
+        return true;
+      })
+      .slice(0, allowedForHost);
     scriptBudget.remaining = Math.max(0, scriptBudget.remaining - candidateScripts.length);
 
     if (candidateScripts.length > 0) {
@@ -1350,6 +1374,7 @@ async function probeWebPageAndHeaders(
     (h) => !isPrivateOrLocalHost(h)
   );
   const seenFinalUrls = new Set<string>();
+  const seenScriptUrls = new Set<string>();
   const scriptBudget = { remaining: 10 };
   const entries: SubdomainWebProbeEntry[] = [];
   const deadline = Date.now() + 8500;
@@ -1360,7 +1385,14 @@ async function probeWebPageAndHeaders(
     while (idx < candidates.length && Date.now() < deadline) {
       const host = candidates[idx++];
       const allowHttpFallback = host === domain || host === `www.${domain}`;
-      const entry = await probeSingleHostWebRecon(host, userAgent, allowHttpFallback, seenFinalUrls, scriptBudget);
+      const entry = await probeSingleHostWebRecon(
+        host,
+        userAgent,
+        allowHttpFallback,
+        seenFinalUrls,
+        seenScriptUrls,
+        scriptBudget
+      );
       if (entry) {
         entries.push(entry);
       }
@@ -1412,7 +1444,6 @@ async function fetchHackerTargetZone(
 }
 
 async function fetchServerPassiveDns(
-  domain: string,
   rootDomain: string,
   userAgent: string,
   discoveredSubdomains: string[] = [],
@@ -1423,12 +1454,24 @@ async function fetchServerPassiveDns(
   pdnsQueriedSubdomainsCount: number;
 }> {
   const ipSet = new Set<string>();
-  const displaySet = new Set<string>();
+  const displayMap = new Map<string, string>();
+  const addPdnsDisplay = (rr: string, host: string, ans: string, span = '') => {
+    const cleanRr = rr.toUpperCase().trim();
+    const cleanHost = host.toLowerCase().trim().replace(/\.$/, '');
+    const cleanAns = ans.trim();
+    if (!cleanRr || !cleanHost || !cleanAns) return;
+    const key = `${cleanRr}|${cleanHost}|${cleanAns.toLowerCase()}`;
+    const formatted = `${cleanRr} | ${cleanHost} -> ${cleanAns}${span}`;
+    const existing = displayMap.get(key);
+    if (!existing || (span && !existing.includes('['))) {
+      displayMap.set(key, formatted);
+    }
+  };
 
   for (const rec of preloadedHtRecords) {
     if (!rec.host || !rec.ip) continue;
     if (/^[\da-fA-F:.]+$/.test(rec.ip)) ipSet.add(rec.ip);
-    displaySet.add(`${rec.ip.includes(':') ? 'AAAA' : 'A'} | ${rec.host} -> ${rec.ip}`);
+    addPdnsDisplay(rec.ip.includes(':') ? 'AAAA' : 'A', rec.host, rec.ip);
   }
 
   const pdnsTargets = prioritizeSubdomainsForRecon(rootDomain, discoveredSubdomains, 16).filter(
@@ -1463,7 +1506,7 @@ async function fetchServerPassiveDns(
           ipSet.add(ans);
         }
         const span = firstSeen && lastSeen ? ` [${firstSeen}..${lastSeen}]` : firstSeen ? ` [${firstSeen}]` : '';
-        displaySet.add(`${rr} | ${q} -> ${ans}${span}`);
+        addPdnsDisplay(rr, q, ans, span);
       }
     } catch {}
   };
@@ -1488,7 +1531,7 @@ async function fetchServerPassiveDns(
             const ans = String(rawAns).trim();
             if (!ans) continue;
             if (/^[\da-fA-F:.]+$/.test(ans)) ipSet.add(ans);
-            displaySet.add(`${ans.includes(':') ? 'AAAA' : 'A'} | ${hostKey.toLowerCase()} -> ${ans}`);
+            addPdnsDisplay(ans.includes(':') ? 'AAAA' : 'A', hostKey, ans);
           }
         }
       }
@@ -1513,7 +1556,7 @@ async function fetchServerPassiveDns(
   ]);
 
   return {
-    passiveDnsDisplay: Array.from(displaySet).sort().slice(0, 250),
+    passiveDnsDisplay: Array.from(displayMap.values()).sort().slice(0, 250),
     passiveDnsIps: Array.from(ipSet).sort(),
     pdnsQueriedSubdomainsCount: pdnsTargets.length,
   };
@@ -1647,15 +1690,18 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
 
   const crtData = crtResult.status === 'fulfilled' ? crtResult.value : null;
   const htData = hackerTargetResult.status === 'fulfilled' ? hackerTargetResult.value : null;
-  const discoveredSubdomains = [
-    ...(crtData?.allSubdomains || []),
-    ...(htData?.hosts || []),
-  ];
+  const discoveredSubdomains = Array.from(
+    new Set(
+      [...(crtData?.allSubdomains || []), ...(htData?.hosts || [])]
+        .map((h) => String(h || '').toLowerCase().trim().replace(/^\.+|\.+$/g, ''))
+        .filter(Boolean)
+    )
+  );
 
   // Phase 2: Search discovered subdomains for Web Recon and Passive DNS
   const [webProbeResult, passiveDnsResult] = await Promise.allSettled([
     probeWebPageAndHeaders(cleanDomain, userAgent, discoveredSubdomains),
-    fetchServerPassiveDns(cleanDomain, rootDomain, userAgent, discoveredSubdomains, htData?.records || []),
+    fetchServerPassiveDns(rootDomain, userAgent, discoveredSubdomains, htData?.records || []),
   ]);
 
   const whoisData = whoisResult.status === 'fulfilled' ? whoisResult.value : null;
@@ -1759,8 +1805,7 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
   const pdnsData = passiveDnsResult.status === 'fulfilled' ? passiveDnsResult.value : null;
 
   if (!tlsData?.tlsIssuerCn && !tlsData?.tlsSubjectCn) {
-    const fallbackTlsHost =
-      webData?.webReconReachableHosts?.find((h) => h !== cleanDomain) || `www.${rootDomain}`;
+    const fallbackTlsHost = webData?.webReconReachableHosts?.find((h) => h !== cleanDomain);
     if (fallbackTlsHost && isValidDomainFormat(fallbackTlsHost) && !isPrivateOrLocalHost(fallbackTlsHost)) {
       try {
         tlsData = await inspectLiveTlsCert(fallbackTlsHost);

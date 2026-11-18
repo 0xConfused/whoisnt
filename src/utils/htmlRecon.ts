@@ -1007,7 +1007,15 @@ export function mergeSubdomainWebRecon(
     return (hasHtml ? 0 : 10) + (isOk ? 0 : 5) + hostScore;
   };
 
-  const ordered = [...entries].sort((a, b) => rankEntry(a) - rankEntry(b));
+  const rawOrdered = [...entries].sort((a, b) => rankEntry(a) - rankEntry(b));
+  const seenEntryHosts = new Set<string>();
+  const ordered: SubdomainWebProbeEntry[] = [];
+  for (const entry of rawOrdered) {
+    const normHost = entry.host.toLowerCase().trim();
+    if (!normHost || seenEntryHosts.has(normHost)) continue;
+    seenEntryHosts.add(normHost);
+    ordered.push({ ...entry, host: normHost });
+  }
   const primary = ordered[0];
 
   const headerSet = new Set<string>();
