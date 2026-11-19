@@ -2,7 +2,6 @@
 
 import React, { useState, useMemo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
 import { WhoisDiffResult, WhoisDomainRecord } from '../types';
-import { CustomSpinner } from './CustomSpinner';
 
 interface OsintTopologyMapProps {
   diff: WhoisDiffResult;
@@ -35,14 +34,6 @@ interface NodePopupDetails {
   title: string;
   subtitle?: string;
   rows: PopupFieldRow[];
-}
-
-interface PreviewState {
-  loading: boolean;
-  html?: string;
-  finalUrl?: string;
-  statusCode?: number;
-  error?: string;
 }
 
 const CANVAS_WIDTH = 1120;
@@ -435,8 +426,6 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [vpSize, setVpSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [popupHeight, setPopupHeight] = useState<number>(280);
-  const [previewOpen, setPreviewOpen] = useState<boolean>(false);
-  const [previewCache, setPreviewCache] = useState<Record<string, PreviewState>>({});
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const popupRef = useRef<HTMLDivElement | null>(null);
@@ -933,14 +922,8 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
     }
     hasInteractedRef.current = false;
     setSelectedNodeId(null);
-    setPreviewOpen(false);
-    setPreviewCache({});
     centerView();
   }, [domainA.domainName, domainB?.domainName, isSingle, activeFilter, centerView]);
-
-  useEffect(() => {
-    setPreviewOpen(false);
-  }, [selectedNodeId]);
 
   useEffect(() => {
     if (!selectedNodeId) return;
@@ -975,7 +958,7 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
   useLayoutEffect(() => {
     if (!popupRef.current) return;
     setPopupHeight(popupRef.current.offsetHeight);
-  }, [popupDetails, vpSize, previewOpen, previewCache]);
+  }, [popupDetails, vpSize]);
 
   useEffect(() => {
     const el = viewportRef.current;
@@ -1078,70 +1061,11 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
     setSelectedNodeId((prev) => (prev === node.id ? null : node.id));
   };
 
-  const isDomainNode = selectedNode?.id === 'domA' || selectedNode?.id === 'domB';
-
-  const handleTogglePreview = useCallback(async () => {
-    if (!selectedNode || (selectedNode.id !== 'domA' && selectedNode.id !== 'domB')) return;
-    if (previewOpen) {
-      setPreviewOpen(false);
-      return;
-    }
-
-    const domain = selectedNode.label.trim().toLowerCase();
-    setPreviewOpen(true);
-
-    const existing = previewCache[domain];
-    if (existing && (existing.loading || existing.html || existing.error)) {
-      return;
-    }
-
-    setPreviewCache((prev) => ({
-      ...prev,
-      [domain]: { loading: true },
-    }));
-
-    try {
-      const res = await fetch(`/api/preview?domain=${encodeURIComponent(domain)}`);
-      const data = await res.json();
-      if (!res.ok) {
-        setPreviewCache((prev) => ({
-          ...prev,
-          [domain]: {
-            loading: false,
-            error: data?.error || `Preview unavailable (HTTP ${res.status}).`,
-            statusCode: data?.statusCode,
-            finalUrl: data?.finalUrl,
-          },
-        }));
-        return;
-      }
-      setPreviewCache((prev) => ({
-        ...prev,
-        [domain]: {
-          loading: false,
-          html: data.html,
-          finalUrl: data.finalUrl,
-          statusCode: data.statusCode,
-        },
-      }));
-    } catch (err: any) {
-      setPreviewCache((prev) => ({
-        ...prev,
-        [domain]: {
-          loading: false,
-          error: err?.message || 'Unable to load website preview.',
-        },
-      }));
-    }
-  }, [selectedNode, previewOpen, previewCache]);
-
   const popupLayout = useMemo(() => {
     if (!selectedNode) return null;
     const widthVp = vpSize.width || 640;
     const heightVp = vpSize.height || viewportHeight;
-    const targetMaxWidth = previewOpen && isDomainNode ? 540 : 340;
-    const targetMinWidth = previewOpen && isDomainNode ? 280 : 240;
-    const popupWidth = Math.min(targetMaxWidth, Math.max(targetMinWidth, widthVp - POPUP_MARGIN * 2));
+    const popupWidth = Math.min(340, Math.max(240, widthVp - POPUP_MARGIN * 2));
     const maxHeight = Math.max(180, heightVp - POPUP_MARGIN * 2);
 
     const nodeLeft = view.x + selectedNode.x * view.zoom;
@@ -1182,7 +1106,7 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
       width: popupWidth,
       maxHeight,
     };
-  }, [selectedNode, vpSize, viewportHeight, view, popupHeight, previewOpen, isDomainNode]);
+  }, [selectedNode, vpSize, viewportHeight, view, popupHeight]);
 
   const popupBorderAccent = useMemo(() => {
     if (!selectedNode) return 'border-[#383838]';
@@ -1446,104 +1370,16 @@ export const OsintTopologyMap: React.FC<OsintTopologyMapProps> = ({ diff }) => {
                 <div className="font-mono text-xs font-bold text-[#f0f0f0] break-all mt-0.5">
                   {popupDetails.title}
                 </div>
-                {popupDetails.subtitle && (
+              {popupDetails.subtitle && (
                   <div className="font-mono text-[10px] text-[#8c8c8c] break-words mt-0.5">
                     {popupDetails.subtitle}
                   </div>
                 )}
               </div>
-              {isDomainNode && (
-                <button
-                  type="button"
-                  onClick={handleTogglePreview}
-                  className="px-2 py-1 text-[10px] font-mono uppercase tracking-wider border border-[#383838] bg-[#141414] hover:bg-[#262626] text-[#f0f0f0] transition-colors rounded-none cursor-pointer font-semibold shrink-0"
-                >
-                  {previewOpen ? 'DETAILS' : 'PREVIEW'}
-                </button>
-              )}
             </div>
 
             <div className="p-3 overflow-y-auto custom-scrollbar space-y-2 text-[11px] font-mono">
-              {previewOpen && isDomainNode ? (
-                (() => {
-                  const domainKey = selectedNode.label.trim().toLowerCase();
-                  const previewState = previewCache[domainKey];
-                  const innerWidth = Math.max(220, popupLayout.width - 24);
-                  const virtualWidth = 1280;
-                  const virtualHeight = 1600;
-                  const scale = innerWidth / virtualWidth;
-                  const frameMaxH = Math.max(150, popupLayout.maxHeight - 108);
-
-                  if (!previewState || previewState.loading) {
-                    return (
-                      <div className="py-8 px-3 border border-[#2e2e2e] bg-[#0d0d0d] flex flex-col items-center justify-center text-center text-[#8c8c8c] text-[11px] uppercase tracking-wider">
-                        <CustomSpinner className="w-8 h-8 text-[#c30800] mb-2.5" />
-                        <span>LOADING STATIC PREVIEW...</span>
-                      </div>
-                    );
-                  }
-
-                  if (previewState.error) {
-                    return (
-                      <div className="p-3 border border-[#c3005a]/50 bg-[#0d0d0d] text-[#f0f0f0] text-[11px] break-words">
-                        <div className="text-[9px] uppercase tracking-wider font-bold text-[#c3005a] mb-1">
-                          PREVIEW UNAVAILABLE
-                        </div>
-                        {previewState.error}
-                      </div>
-                    );
-                  }
-
-                  if (!previewState.html) {
-                    return (
-                      <div className="p-3 border border-[#2e2e2e] bg-[#0d0d0d] text-[#8c8c8c] text-[11px]">
-                        No preview markup available.
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between gap-2 text-[9px] uppercase tracking-wider text-[#8c8c8c]">
-                        <span className="truncate">
-                          {previewState.finalUrl || selectedNode.label}
-                        </span>
-                        <span className="shrink-0">
-                          {previewState.statusCode ? `HTTP ${previewState.statusCode} // ` : ''}NO-JS SANDBOX
-                        </span>
-                      </div>
-                      <div
-                        style={{ maxHeight: `${frameMaxH}px` }}
-                        className="overflow-y-auto overflow-x-hidden custom-scrollbar border border-[#2e2e2e] bg-white"
-                      >
-                        <div
-                          style={{
-                            width: `${innerWidth}px`,
-                            height: `${Math.round(virtualHeight * scale)}px`,
-                            overflow: 'hidden',
-                            position: 'relative',
-                          }}
-                        >
-                          <iframe
-                            sandbox=""
-                            referrerPolicy="no-referrer"
-                            title={`Static preview of ${selectedNode.label}`}
-                            srcDoc={previewState.html}
-                            style={{
-                              width: `${virtualWidth}px`,
-                              height: `${virtualHeight}px`,
-                              transform: `scale(${scale})`,
-                              transformOrigin: '0 0',
-                              border: 0,
-                            }}
-                            className="block bg-white pointer-events-none"
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })()
-              ) : popupDetails.rows.length > 0 ? (
+              {popupDetails.rows.length > 0 ? (
                 popupDetails.rows.map((row, idx) => (
                   <div
                     key={`${row.label}-${idx}`}

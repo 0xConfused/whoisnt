@@ -78,6 +78,14 @@ export default function App() {
 
   const [, startTransition] = useTransition();
   const tabBarRef = useRef<HTMLDivElement | null>(null);
+  const activeLookupAbortRef = useRef<AbortController | null>(null);
+  const lookupSeqRef = useRef<number>(0);
+
+  useEffect(() => {
+    return () => {
+      activeLookupAbortRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     const updateStickyOffsets = () => {
@@ -110,6 +118,8 @@ export default function App() {
       const cleanB = sanitizeDomainInput(targetB);
 
       if (!cleanA && !cleanB) {
+        activeLookupAbortRef.current?.abort();
+        lookupSeqRef.current += 1;
         setDiffResult(null);
         setError(null);
         return;
@@ -137,16 +147,33 @@ export default function App() {
         }
       }
 
+      activeLookupAbortRef.current?.abort();
+      const abortController = new AbortController();
+      activeLookupAbortRef.current = abortController;
+      const seq = ++lookupSeqRef.current;
+
       setIsLoading(true);
       setError(null);
 
       try {
-        const result = await fetchAndCompareWhois(cleanA, cleanB);
+        const result = await fetchAndCompareWhois(
+          cleanA,
+          cleanB,
+          (updatedResult) => {
+            if (lookupSeqRef.current !== seq || abortController.signal.aborted) return;
+            startTransition(() => {
+              setDiffResult(updatedResult);
+            });
+          },
+          abortController.signal
+        );
+        if (lookupSeqRef.current !== seq || abortController.signal.aborted) return;
         startTransition(() => {
           setDiffResult(result);
           setIsLoading(false);
         });
       } catch (err: any) {
+        if (lookupSeqRef.current !== seq || abortController.signal.aborted) return;
         setIsLoading(false);
         setError(err.message || 'Failed to retrieve authoritative WHOIS & OSINT records.');
       }
@@ -185,6 +212,9 @@ export default function App() {
   };
 
   const handleReset = () => {
+    activeLookupAbortRef.current?.abort();
+    lookupSeqRef.current += 1;
+    setIsLoading(false);
     setDomainA('');
     setDomainB('');
     setDiffResult(null);

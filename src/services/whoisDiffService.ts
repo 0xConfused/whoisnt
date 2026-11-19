@@ -8,6 +8,7 @@ import {
   SharedLinkageInsight,
   TextDiffLine,
   DiffStatus,
+  CtCertificateEntry,
 } from '../types';
 import { extractApexDomain, sanitizeDomainInput, isValidDomainFormat, prioritizeSubdomainsForRecon } from '../utils/urlUtils';
 import { enrichDomainWithBrowserDns, queryBrowserDoh } from './browserDnsService';
@@ -2261,12 +2262,514 @@ async function lookupClientIpAsn(
   return { subnet24 };
 }
 
-async function fetchClientCtSubdomains(rootDomain: string): Promise<{
+function decodeDerLength(bytes: Uint8Array, offset: number): { length: number; bytesUsed: number } | null {
+  if (offset >= bytes.length) return null;
+  const first = bytes[offset];
+  if (first < 0x80) return { length: first, bytesUsed: 1 };
+  const numBytes = first & 0x7f;
+  if (numBytes === 0 || numBytes > 4 || offset + numBytes >= bytes.length) return null;
+  let length = 0;
+  for (let i = 1; i <= numBytes; i++) {
+    length = (length << 8) | bytes[offset + i];
+  }
+  return { length, bytesUsed: 1 + numBytes };
+}
+
+function readDerTlv(
+  bytes: Uint8Array,
+  offset: number
+): { tag: number; valueStart: number; valueEnd: number; next: number } | null {
+  if (offset >= bytes.length) return null;
+  const tag = bytes[offset];
+  const lenInfo = decodeDerLength(bytes, offset + 1);
+  if (!lenInfo) return null;
+  const valueStart = offset + 1 + lenInfo.bytesUsed;
+  const valueEnd = valueStart + lenInfo.length;
+  if (valueEnd > bytes.length) return null;
+  return { tag, valueStart, valueEnd, next: valueEnd };
+}
+
+async function parseX509CertMetadataFromPem(pem?: string): Promise<{
+  issuerOrg?: string;
+  issuerCn?: string;
+  sha256?: string;
+}> {
+  if (!pem || typeof pem !== 'string') return {};
+  try {
+    const b64 = pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+    if (!b64) return {};
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+
+    let sha256: string | undefined;
+    if (typeof crypto !== 'undefined' && crypto.subtle) {
+      try {
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        sha256 = Array.from(new Uint8Array(digest))
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
+      } catch {}
+    }
+
+    let issuerOrg: string | undefined;
+    let issuerCn: string | undefined;
+
+    const certSeq = readDerTlv(bytes, 0);
+    const tbsSeq = certSeq ? readDerTlv(bytes, certSeq.valueStart) : null;
+    if (tbsSeq) {
+      let cursor = tbsSeq.valueStart;
+      const firstField = readDerTlv(bytes, cursor);
+      if (firstField && firstField.tag === 0xa0) cursor = firstField.next; // optional explicit [0] version
+      const serial = readDerTlv(bytes, cursor);
+      const sigAlg = serial ? readDerTlv(bytes, serial.next) : null;
+      const issuer = sigAlg ? readDerTlv(bytes, sigAlg.next) : null;
+      if (issuer && issuer.tag === 0x30) {
+        const decoder = new TextDecoder();
+        let rdnCursor = issuer.valueStart;
+        while (rdnCursor < issuer.valueEnd) {
+          const rdnSet = readDerTlv(bytes, rdnCursor);
+          if (!rdnSet) break;
+          let attrCursor = rdnSet.valueStart;
+          while (attrCursor < rdnSet.valueEnd) {
+            const attrSeq = readDerTlv(bytes, attrCursor);
+            if (!attrSeq) break;
+            const oidTlv = readDerTlv(bytes, attrSeq.valueStart);
+            const valTlv = oidTlv ? readDerTlv(bytes, oidTlv.next) : null;
+            if (oidTlv && valTlv && oidTlv.tag === 0x06) {
+              const oid = bytes.subarray(oidTlv.valueStart, oidTlv.valueEnd);
+              const valStr = decoder.decode(bytes.subarray(valTlv.valueStart, valTlv.valueEnd)).trim();
+              if (oid.length === 3 && oid[0] === 0x55 && oid[1] === 0x04) {
+                if (oid[2] === 10 && !issuerOrg && valStr) issuerOrg = valStr;
+                if (oid[2] === 3 && !issuerCn && valStr) issuerCn = valStr;
+              }
+            }
+            attrCursor = attrSeq.next;
+          }
+          rdnCursor = rdnSet.next;
+        }
+      }
+    }
+
+    return { issuerOrg, issuerCn, sha256 };
+  } catch {
+    return {};
+  }
+}
+
+async function fetchBrowserTlsCertsViaCorsInspector(
+  cleanApex: string,
+  discoveredHosts: string[],
+  subsSet: Set<string>,
+  onWildcard: () => void
+): Promise<CtCertificateEntry[]> {
+  const probeTargets = prioritizeSubdomainsForRecon(cleanApex, discoveredHosts, 8)
+    .filter((h) => !h.startsWith('*.'))
+    .slice(0, 8);
+  if (probeTargets.length === 0) return [];
+
+  const results: CtCertificateEntry[] = [];
+  let idx = 0;
+  const concurrency = Math.min(4, probeTargets.length);
+
+  const probeOne = async (host: string) => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(`https://networkcalc.com/api/security/certificate/${encodeURIComponent(host)}`, {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const json = await res.json();
+      const cert = json?.certificate;
+      if (!cert || json?.status !== 'OK') return;
+
+      const sanList = new Set<string>();
+      const rawAlt = Array.isArray(cert.alternate_names) ? cert.alternate_names : [];
+      for (const rawName of rawAlt) {
+        const cleaned = String(rawName)
+          .replace(/^DNS:/i, '')
+          .toLowerCase()
+          .trim()
+          .replace(/^\.+|\.+$/g, '');
+        if (!cleaned) continue;
+        if (cleaned.startsWith('*.')) onWildcard();
+        const base = cleaned.startsWith('*.') ? cleaned.slice(2) : cleaned;
+        if (base && (base === cleanApex || base.endsWith(`.${cleanApex}`))) {
+          sanList.add(cleaned);
+          subsSet.add(cleaned);
+        }
+      }
+      if (sanList.size === 0 && (host === cleanApex || host.endsWith(`.${cleanApex}`))) {
+        sanList.add(host);
+        subsSet.add(host);
+      }
+      if (sanList.size === 0) return;
+
+      const parsedPem = await parseX509CertMetadataFromPem(cert.raw);
+      const fallbackFingerprint =
+        typeof cert.fingerprint === 'string' && cert.fingerprint.trim()
+          ? cert.fingerprint.replace(/:/g, '').toLowerCase()
+          : undefined;
+      const serial = typeof cert.serial_number === 'string' ? cert.serial_number.trim() : undefined;
+      const sha256 = parsedPem.sha256 || fallbackFingerprint;
+
+      results.push({
+        id: serial || sha256 || `live-${host}`,
+        issuerOrg: parsedPem.issuerOrg || (typeof cert.issued_by === 'string' ? cert.issued_by.trim() : undefined),
+        issuerCn: parsedPem.issuerCn || (typeof cert.issued_by === 'string' ? cert.issued_by.trim() : undefined),
+        notBefore: typeof cert.valid_from === 'string' ? cert.valid_from : undefined,
+        notAfter: typeof cert.valid_to === 'string' ? cert.valid_to : undefined,
+        revoked: false,
+        sha256,
+        dnsNames: Array.from(sanList).sort(),
+      });
+    } catch {}
+  };
+
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (idx < probeTargets.length) {
+      const host = probeTargets[idx++];
+      await probeOne(host);
+    }
+  });
+  await Promise.all(workers);
+
+  return results;
+}
+
+function parseClientIssuerDn(issuerDn: string): { issuerOrg?: string; issuerCn?: string } {
+  const raw = String(issuerDn || '');
+  const orgMatch = raw.match(/(?:^|,\s*)O=(?:"([^"]+)"|([^,]+))/);
+  const cnMatch = raw.match(/(?:^|,\s*)CN=(?:"([^"]+)"|([^,]+))/);
+  return {
+    issuerOrg: (orgMatch?.[1] || orgMatch?.[2] || '').trim() || undefined,
+    issuerCn: (cnMatch?.[1] || cnMatch?.[2] || '').trim() || undefined,
+  };
+}
+
+function normalizeCrtShDate(val: unknown): string | undefined {
+  if (typeof val !== 'string') return undefined;
+  const trimmed = val.trim();
+  if (!trimmed) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(trimmed)) {
+    return `${trimmed}Z`;
+  }
+  return trimmed;
+}
+
+const clientCrtShCache = new Map<
+  string,
+  { certs: CtCertificateEntry[]; subdomains: string[]; fetchedAt: number }
+>();
+
+function buildCertSemanticKey(cert: Pick<CtCertificateEntry, 'issuerOrg' | 'notBefore' | 'notAfter' | 'dnsNames'>): string {
+  const nb = cert.notBefore ? cert.notBefore.slice(0, 10) : '';
+  const na = cert.notAfter ? cert.notAfter.slice(0, 10) : '';
+  return `${(cert.issuerOrg || '').toLowerCase()}|${nb}|${na}|${cert.dnsNames.join(',')}`;
+}
+
+function deduplicateAndSortCertificates(certs: CtCertificateEntry[], limit = 120): CtCertificateEntry[] {
+  const bySha = new Map<string, CtCertificateEntry>();
+  const bySemantic = new Map<string, CtCertificateEntry>();
+  const merged: CtCertificateEntry[] = [];
+
+  for (const cert of certs) {
+    const shaKey = cert.sha256 ? cert.sha256.toLowerCase().trim() : '';
+    const semanticKey = buildCertSemanticKey(cert);
+
+    if (shaKey && bySha.has(shaKey)) continue;
+    const existingSemantic = bySemantic.get(semanticKey);
+    if (existingSemantic) {
+      // Keep richer entry (one that already has sha256 or revoked status)
+      if (!existingSemantic.sha256 && shaKey) {
+        const idx = merged.indexOf(existingSemantic);
+        if (idx !== -1) merged[idx] = cert;
+        bySemantic.set(semanticKey, cert);
+        bySha.set(shaKey, cert);
+      }
+      continue;
+    }
+
+    if (shaKey) bySha.set(shaKey, cert);
+    bySemantic.set(semanticKey, cert);
+    merged.push(cert);
+  }
+
+  return merged
+    .sort((a, b) => {
+      const tA = a.notBefore ? Date.parse(a.notBefore) || 0 : 0;
+      const tB = b.notBefore ? Date.parse(b.notBefore) || 0 : 0;
+      return tB - tA;
+    })
+    .slice(0, limit);
+}
+
+interface CrtShFetchResult {
+  ok: boolean;
+  certs: CtCertificateEntry[];
+  subdomains: string[];
+}
+
+interface CrtShTracker {
+  promise: Promise<CrtShFetchResult>;
+  settled: boolean;
+  result?: CrtShFetchResult;
+  currentAttempt: number;
+  setShouldPersistRetry: (val: boolean) => void;
+  stop: () => void;
+}
+
+function createClientCrtShTracker(
+  rootDomain: string,
+  externalSignal?: AbortSignal,
+  onAttempt?: (attempt: number) => void
+): CrtShTracker {
+  let persistRetry = false;
+  let stopped = false;
+  const stopController = new AbortController();
+  let resolvePersistReady: ((val: boolean) => void) | null = null;
+  const persistReadyPromise = new Promise<boolean>((resolve) => {
+    resolvePersistReady = resolve;
+  });
+
+  const tracker: CrtShTracker = {
+    promise: Promise.resolve({ ok: false, certs: [], subdomains: [] }),
+    settled: false,
+    currentAttempt: 1,
+    setShouldPersistRetry: (val: boolean) => {
+      persistRetry = val;
+      if (resolvePersistReady) {
+        resolvePersistReady(val);
+        resolvePersistReady = null;
+      }
+    },
+    stop: () => {
+      if (stopped) return;
+      stopped = true;
+      persistRetry = false;
+      if (resolvePersistReady) {
+        resolvePersistReady(false);
+        resolvePersistReady = null;
+      }
+      stopController.abort();
+      if (!tracker.settled) {
+        tracker.settled = true;
+        tracker.result = { ok: false, certs: [], subdomains: [] };
+      }
+    },
+  };
+
+  tracker.promise = (async (): Promise<CrtShFetchResult> => {
+    const cleanApex = (extractApexDomain(rootDomain) || rootDomain)
+      .toLowerCase()
+      .trim()
+      .replace(/^\.+|\.+$/g, '');
+    if (!cleanApex || !isValidDomainFormat(cleanApex)) {
+      const empty: CrtShFetchResult = { ok: true, certs: [], subdomains: [] };
+      tracker.settled = true;
+      tracker.result = empty;
+      return empty;
+    }
+
+    const cached = clientCrtShCache.get(cleanApex);
+    if (cached && Date.now() - cached.fetchedAt < 10 * 60 * 1000) {
+      const hit: CrtShFetchResult = { ok: true, certs: cached.certs, subdomains: cached.subdomains };
+      tracker.settled = true;
+      tracker.result = hit;
+      return hit;
+    }
+
+    const INITIAL_ATTEMPTS = 3;
+    const url = `https://crt.sh/?q=${encodeURIComponent(`%.${cleanApex}`)}&output=json`;
+
+    const isAborted = () => stopped || Boolean(externalSignal?.aborted) || stopController.signal.aborted;
+
+    const sleepAbortable = (ms: number) =>
+      new Promise<void>((resolve) => {
+        if (isAborted()) {
+          resolve();
+          return;
+        }
+        const onAbort = () => {
+          clearTimeout(t);
+          externalSignal?.removeEventListener('abort', onAbort);
+          stopController.signal.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        const t = setTimeout(() => {
+          externalSignal?.removeEventListener('abort', onAbort);
+          stopController.signal.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+        externalSignal?.addEventListener('abort', onAbort, { once: true });
+        stopController.signal.addEventListener('abort', onAbort, { once: true });
+      });
+
+    let attempt = 1;
+    while (!isAborted()) {
+      tracker.currentAttempt = attempt;
+      if (attempt > 1 && !isAborted()) {
+        onAttempt?.(attempt);
+      }
+
+      const timeoutMs = Math.min(30000, 15000 + (attempt - 1) * 4000);
+      const controller = new AbortController();
+      const onExternalAbort = () => controller.abort();
+      externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+      stopController.signal.addEventListener('abort', onExternalAbort, { once: true });
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const res = await fetch(url, {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        externalSignal?.removeEventListener('abort', onExternalAbort);
+        stopController.signal.removeEventListener('abort', onExternalAbort);
+
+        if (isAborted()) break;
+
+        if (res.ok) {
+          const text = await readBoundedResponseText(res, 3 * 1024 * 1024);
+          const items = JSON.parse(text);
+          if (Array.isArray(items)) {
+            const parsedCerts: CtCertificateEntry[] = [];
+            const subSet = new Set<string>();
+
+            for (const item of items.slice(0, 300)) {
+              const rawNames = String(item?.name_value || item?.common_name || '')
+                .split(/[\r\n,]+/)
+                .map((s) => s.trim())
+                .filter(Boolean);
+              const dnsSet = new Set<string>();
+              for (const rawName of rawNames) {
+                const cleaned = rawName.toLowerCase().replace(/^\.+|\.+$/g, '');
+                if (!cleaned) continue;
+                const base = cleaned.startsWith('*.') ? cleaned.slice(2) : cleaned;
+                if (base && (base === cleanApex || base.endsWith(`.${cleanApex}`))) {
+                  dnsSet.add(cleaned);
+                  subSet.add(cleaned);
+                }
+              }
+              if (dnsSet.size === 0) continue;
+
+              const parsedDn = parseClientIssuerDn(String(item?.issuer_name || ''));
+              parsedCerts.push({
+                id: String(item?.id || parsedCerts.length + 1),
+                issuerOrg: parsedDn.issuerOrg,
+                issuerCn: parsedDn.issuerCn,
+                notBefore: normalizeCrtShDate(item?.not_before),
+                notAfter: normalizeCrtShDate(item?.not_after),
+                dnsNames: Array.from(dnsSet).sort(),
+              });
+            }
+
+            const certs = deduplicateAndSortCertificates(parsedCerts, 120);
+            const subdomains = Array.from(subSet).sort();
+            clientCrtShCache.set(cleanApex, { certs, subdomains, fetchedAt: Date.now() });
+            const success: CrtShFetchResult = { ok: true, certs, subdomains };
+            tracker.settled = true;
+            tracker.result = success;
+            return success;
+          }
+        }
+      } catch {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener('abort', onExternalAbort);
+        stopController.signal.removeEventListener('abort', onExternalAbort);
+      }
+
+      if (isAborted()) break;
+
+      if (attempt >= INITIAL_ATTEMPTS) {
+        const shouldContinue = resolvePersistReady ? await persistReadyPromise : persistRetry;
+        if (!shouldContinue || isAborted()) break;
+      }
+
+      const waitMs = Math.min(60000, 2000 * Math.pow(2, attempt - 1));
+      await sleepAbortable(waitMs);
+      attempt++;
+    }
+
+    const done: CrtShFetchResult = { ok: false, certs: [], subdomains: [] };
+    tracker.settled = true;
+    tracker.result = done;
+    return done;
+  })();
+
+  return tracker;
+}
+
+function mergeCrtShDataIntoRecord(
+  record: WhoisDomainRecord,
+  crtShData: { certs: CtCertificateEntry[]; subdomains: string[] },
+  nextStatus?: 'idle' | 'collecting' | 'complete',
+  nextAttempt?: number
+): { record: WhoisDomainRecord; changed: boolean } {
+  const prevCerts = record.crtCertificates || [];
+  const mergedCerts =
+    crtShData.certs.length > 0
+      ? deduplicateAndSortCertificates([...prevCerts, ...crtShData.certs], 120)
+      : prevCerts;
+
+  const prevSubs = record.crtSubdomainsSample || [];
+  const mergedSubSet = new Set<string>(prevSubs);
+  for (const s of crtShData.subdomains) {
+    mergedSubSet.add(s);
+  }
+  const mergedSubs = Array.from(mergedSubSet).sort();
+  const cappedSubs = mergedSubs.slice(0, 150);
+  const nextCount = Math.max(record.crtSubdomainsCount || 0, mergedSubs.length);
+  const nextWildcard = Boolean(record.crtWildcardFound || mergedSubs.some((s) => s.startsWith('*.')));
+
+  const certsChanged =
+    mergedCerts.length !== prevCerts.length ||
+    mergedCerts.some((c, i) => prevCerts[i]?.id !== c.id || prevCerts[i]?.dnsNames.length !== c.dnsNames.length);
+  const subsChanged =
+    cappedSubs.length !== prevSubs.length || nextCount !== (record.crtSubdomainsCount || 0);
+  const statusChanged =
+    (nextStatus !== undefined && nextStatus !== record.crtShStatus) ||
+    (nextAttempt !== undefined && nextAttempt !== record.crtShAttempt);
+
+  if (!certsChanged && !subsChanged && !statusChanged) {
+    return { record, changed: false };
+  }
+
+  const primaryCert = mergedCerts.find((c) => !c.revoked) || mergedCerts[0];
+  return {
+    changed: true,
+    record: {
+      ...record,
+      crtCertificates: mergedCerts,
+      crtSubdomainsSample: cappedSubs,
+      crtSubdomainsCount: nextCount,
+      crtWildcardFound: nextWildcard,
+      crtShStatus: nextStatus ?? record.crtShStatus,
+      crtShAttempt: nextAttempt ?? record.crtShAttempt,
+      tlsIssuerOrg: record.tlsIssuerOrg || primaryCert?.issuerOrg,
+      tlsIssuerCn: record.tlsIssuerCn || primaryCert?.issuerCn,
+      tlsValidityNotBefore: record.tlsValidityNotBefore || primaryCert?.notBefore,
+      tlsValidityNotAfter: record.tlsValidityNotAfter || primaryCert?.notAfter,
+    },
+  };
+}
+
+async function fetchClientCtSubdomains(
+  rootDomain: string,
+  seedSubdomains: string[] = []
+): Promise<{
   crtSubdomainsCount: number;
   crtSubdomainsSample: string[];
   allSubdomains: string[];
   hackerTargetRecords: Array<{ host: string; ip: string }>;
   crtWildcardFound: boolean;
+  crtCertificates: CtCertificateEntry[];
   tlsIssuerOrg?: string;
   tlsIssuerCn?: string;
   tlsValidityNotBefore?: string;
@@ -2276,13 +2779,58 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
     .toLowerCase()
     .trim()
     .replace(/^\.+|\.+$/g, '');
-  const subs = new Set<string>();
+  const subs = new Set<string>(
+    seedSubdomains
+      .map((s) => s.toLowerCase().trim().replace(/^\.+|\.+$/g, ''))
+      .filter((s) => {
+        const base = s.startsWith('*.') ? s.slice(2) : s;
+        return Boolean(base) && (base === cleanApex || base.endsWith(`.${cleanApex}`));
+      })
+  );
   const hackerTargetRecords: Array<{ host: string; ip: string }> = [];
-  let crtWildcardFound = false;
+  const rawCerts: CtCertificateEntry[] = [];
+  let crtWildcardFound = Array.from(subs).some((s) => s.startsWith('*.'));
   let tlsIssuerOrg: string | undefined;
   let tlsIssuerCn: string | undefined;
   let tlsValidityNotBefore: string | undefined;
   let tlsValidityNotAfter: string | undefined;
+
+  const queryCrtName = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(`https://crt.name/v1/search?apex=${encodeURIComponent(cleanApex)}`, {
+        headers: { Accept: 'application/json, text/plain' },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const text = await res.text();
+      let items: string[] = [];
+      try {
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) {
+          items = parsed
+            .map((entry: any) => (entry?.sub || entry?.name || (typeof entry === 'string' ? entry : '')).trim())
+            .filter(Boolean);
+        }
+      } catch {
+        items = text
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
+      }
+      for (const item of items.slice(0, 500)) {
+        const cleaned = item.toLowerCase().replace(/\s+/g, '').replace(/^\.+|\.+$/g, '');
+        if (!cleaned) continue;
+        if (cleaned.startsWith('*.')) crtWildcardFound = true;
+        const base = cleaned.startsWith('*.') ? cleaned.slice(2) : cleaned;
+        if (base && (base === cleanApex || base.endsWith(`.${cleanApex}`))) {
+          subs.add(cleaned);
+        }
+      }
+    } catch {}
+  };
 
   const queryCertspotter = async () => {
     try {
@@ -2298,24 +2846,46 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
         if (Array.isArray(items)) {
           const preferred = items.find((it: any) => it && !it.revoked && it.issuer) || items[0];
           if (preferred) {
-            const issuerName = String(preferred.issuer?.name || '');
-            const orgMatch = issuerName.match(/(?:^|,\s*)O=([^,]+)/);
-            const cnMatch = issuerName.match(/(?:^|,\s*)CN=([^,]+)/);
-            tlsIssuerOrg = orgMatch?.[1]?.trim() || preferred.issuer?.friendly_name || undefined;
-            tlsIssuerCn = cnMatch?.[1]?.trim() || undefined;
+            const parsedDn = parseClientIssuerDn(String(preferred.issuer?.name || ''));
+            tlsIssuerOrg = parsedDn.issuerOrg || preferred.issuer?.friendly_name || undefined;
+            tlsIssuerCn = parsedDn.issuerCn;
             if (preferred.not_before) tlsValidityNotBefore = String(preferred.not_before);
             if (preferred.not_after) tlsValidityNotAfter = String(preferred.not_after);
           }
 
           for (const item of items) {
             if (!Array.isArray(item?.dns_names)) continue;
+            const certDnsSet = new Set<string>();
             for (const name of item.dns_names) {
               const cleaned = String(name).toLowerCase().trim().replace(/^\.+|\.+$/g, '');
               if (cleaned.startsWith('*.')) crtWildcardFound = true;
               const base = cleaned.startsWith('*.') ? cleaned.slice(2) : cleaned;
               if (base && (base === cleanApex || base.endsWith(`.${cleanApex}`))) {
                 subs.add(cleaned);
+                certDnsSet.add(cleaned);
               }
+            }
+            if (certDnsSet.size > 0) {
+              const parsedDn = parseClientIssuerDn(String(item.issuer?.name || ''));
+              const sha256 =
+                typeof item.tbs_sha256 === 'string'
+                  ? item.tbs_sha256
+                  : typeof item.cert_sha256 === 'string'
+                  ? item.cert_sha256
+                  : undefined;
+
+              rawCerts.push({
+                id: String(item.id || sha256 || rawCerts.length + 1),
+                issuerOrg:
+                  parsedDn.issuerOrg ||
+                  (typeof item.issuer?.friendly_name === 'string' ? item.issuer.friendly_name.trim() : undefined),
+                issuerCn: parsedDn.issuerCn,
+                notBefore: typeof item.not_before === 'string' ? item.not_before : undefined,
+                notAfter: typeof item.not_after === 'string' ? item.not_after : undefined,
+                revoked: Boolean(item.revoked),
+                sha256,
+                dnsNames: Array.from(certDnsSet).sort(),
+              });
             }
           }
         }
@@ -2351,14 +2921,38 @@ async function fetchClientCtSubdomains(rootDomain: string): Promise<{
     } catch {}
   };
 
-  await Promise.all([queryCertspotter(), queryHackerTarget()]);
+  await Promise.all([queryCrtName(), queryCertspotter(), queryHackerTarget()]);
+
+  // Fallback in pure browser JS when Certspotter is rate-limited/empty: inspect live leaf certificates via CORS TLS inspector
+  if (rawCerts.length === 0) {
+    const liveCerts = await fetchBrowserTlsCertsViaCorsInspector(
+      cleanApex,
+      Array.from(subs),
+      subs,
+      () => {
+        crtWildcardFound = true;
+      }
+    );
+    if (liveCerts.length > 0) {
+      rawCerts.push(...liveCerts);
+      const primaryCert = liveCerts[0];
+      if (!tlsIssuerOrg && primaryCert.issuerOrg) tlsIssuerOrg = primaryCert.issuerOrg;
+      if (!tlsIssuerCn && primaryCert.issuerCn) tlsIssuerCn = primaryCert.issuerCn;
+      if (!tlsValidityNotBefore && primaryCert.notBefore) tlsValidityNotBefore = primaryCert.notBefore;
+      if (!tlsValidityNotAfter && primaryCert.notAfter) tlsValidityNotAfter = primaryCert.notAfter;
+    }
+  }
+
   const sorted = Array.from(subs).sort();
+  const crtCertificates = deduplicateAndSortCertificates(rawCerts, 80);
+
   return {
     crtSubdomainsCount: sorted.length,
     crtSubdomainsSample: sorted.slice(0, 120),
     allSubdomains: sorted,
     hackerTargetRecords,
     crtWildcardFound,
+    crtCertificates,
     tlsIssuerOrg,
     tlsIssuerCn,
     tlsValidityNotBefore,
@@ -2849,6 +3443,7 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
     crtSubdomainsCount: ctData.crtSubdomainsCount,
     crtSubdomainsSample: ctData.crtSubdomainsSample,
     crtWildcardFound: ctData.crtWildcardFound,
+    crtCertificates: ctData.crtCertificates,
     htmlVerificationTokens: webData.htmlVerificationTokens || [],
     analyticsIds: webData.analyticsIds || [],
     footerCopyrights: webData.footerCopyrights || [],
@@ -2884,6 +3479,37 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
   };
 }
 
+async function enrichClientCertsIfMissing(record: WhoisDomainRecord): Promise<WhoisDomainRecord> {
+  if (record.crtCertificates && record.crtCertificates.length > 0) {
+    return record;
+  }
+  try {
+    const ctFallback = await fetchClientCtSubdomains(
+      record.rootDomain || record.domainName,
+      record.crtSubdomainsSample || []
+    );
+    if (ctFallback.crtCertificates.length === 0) {
+      return record;
+    }
+    const mergedSubs = Array.from(
+      new Set([...(record.crtSubdomainsSample || []), ...ctFallback.crtSubdomainsSample])
+    ).sort();
+    return {
+      ...record,
+      crtCertificates: ctFallback.crtCertificates,
+      crtSubdomainsSample: mergedSubs.slice(0, 120),
+      crtSubdomainsCount: Math.max(record.crtSubdomainsCount || 0, ctFallback.crtSubdomainsCount, mergedSubs.length),
+      crtWildcardFound: Boolean(record.crtWildcardFound || ctFallback.crtWildcardFound),
+      tlsIssuerOrg: record.tlsIssuerOrg || ctFallback.tlsIssuerOrg,
+      tlsIssuerCn: record.tlsIssuerCn || ctFallback.tlsIssuerCn,
+      tlsValidityNotBefore: record.tlsValidityNotBefore || ctFallback.tlsValidityNotBefore,
+      tlsValidityNotAfter: record.tlsValidityNotAfter || ctFallback.tlsValidityNotAfter,
+    };
+  } catch {
+    return record;
+  }
+}
+
 async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
   const clean = sanitizeDomainInput(domain);
   if (!isValidDomainFormat(clean)) {
@@ -2905,7 +3531,8 @@ async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
         const data = await res.json();
         if (data && data.domainName) {
           backendApiAvailable = true;
-          return enrichDomainWithBrowserDns(data as WhoisDomainRecord);
+          const enriched = await enrichDomainWithBrowserDns(data as WhoisDomainRecord);
+          return enrichClientCertsIfMissing(enriched);
         }
       } else if (res.status === 404 || res.status === 405 || !ct.includes('application/json')) {
         backendApiAvailable = false;
@@ -2919,7 +3546,12 @@ async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
   return enrichDomainWithBrowserDns(clientRecord);
 }
 
-export async function fetchAndCompareWhois(domainA: string, domainB?: string): Promise<WhoisDiffResult> {
+export async function fetchAndCompareWhois(
+  domainA: string,
+  domainB?: string,
+  onUpdate?: (updatedResult: WhoisDiffResult) => void,
+  signal?: AbortSignal
+): Promise<WhoisDiffResult> {
   const cleanA = sanitizeDomainInput(domainA || '');
   const cleanB = sanitizeDomainInput(domainB || '');
 
@@ -2936,9 +3568,106 @@ export async function fetchAndCompareWhois(domainA: string, domainB?: string): P
   // Single-domain OSINT reconnaissance mode when only one domain is provided
   if (!cleanA || !cleanB) {
     const singleDomain = cleanA || cleanB;
+    let latestRecord: WhoisDomainRecord | null = null;
+
+    const crtShTracker = createClientCrtShTracker(singleDomain, signal, (attempt) => {
+      if (!latestRecord || !onUpdate || signal?.aborted) return;
+      const { record: updated, changed } = mergeCrtShDataIntoRecord(
+        latestRecord,
+        { certs: [], subdomains: [] },
+        'collecting',
+        attempt
+      );
+      if (changed) {
+        latestRecord = updated;
+        onUpdate(computeSingleDomainResult(latestRecord));
+      }
+    });
+
     const record = await fetchDomainWhois(singleDomain);
-    return computeSingleDomainResult(record);
+    const hasRetrievedCertData = (record.crtCertificates?.length || 0) > 0;
+
+    if (hasRetrievedCertData) {
+      const resolvedData =
+        crtShTracker.settled && crtShTracker.result
+          ? crtShTracker.result
+          : { certs: [], subdomains: [] };
+      crtShTracker.stop();
+      const { record: merged } = mergeCrtShDataIntoRecord(
+        record,
+        resolvedData,
+        'complete',
+        crtShTracker.currentAttempt
+      );
+      return computeSingleDomainResult(merged);
+    }
+
+    crtShTracker.setShouldPersistRetry((record.crtSubdomainsCount || 0) > 0);
+
+    if (crtShTracker.settled && crtShTracker.result) {
+      const { record: merged } = mergeCrtShDataIntoRecord(record, crtShTracker.result, 'complete', crtShTracker.currentAttempt);
+      return computeSingleDomainResult(merged);
+    }
+
+    latestRecord = {
+      ...record,
+      crtShStatus: 'collecting',
+      crtShAttempt: crtShTracker.currentAttempt,
+    };
+
+    if (onUpdate && !signal?.aborted) {
+      void crtShTracker.promise.then((crtShData) => {
+        if (signal?.aborted || !latestRecord) return;
+        const { record: merged, changed } = mergeCrtShDataIntoRecord(
+          latestRecord,
+          crtShData,
+          'complete',
+          crtShTracker.currentAttempt
+        );
+        if (changed) {
+          latestRecord = merged;
+          onUpdate(computeSingleDomainResult(latestRecord));
+        }
+      });
+    }
+
+    return computeSingleDomainResult(latestRecord);
   }
+
+  let latestA: WhoisDomainRecord | null = null;
+  let latestB: WhoisDomainRecord | null = null;
+
+  const emitPairUpdate = (nextA: WhoisDomainRecord, nextB: WhoisDomainRecord, changed: boolean) => {
+    if (!onUpdate || signal?.aborted || !changed) return;
+    latestA = nextA;
+    latestB = nextB;
+    onUpdate(computeWhoisDiff(latestA, latestB));
+  };
+
+  // Kick off crt.sh queries in parallel so initial UI prepopulates immediately with crt.name/fast sources
+  const crtShTrackerA = createClientCrtShTracker(cleanA, signal, (attempt) => {
+    if (!latestA || !latestB) return;
+    const { record: nextA, changed } = mergeCrtShDataIntoRecord(
+      latestA,
+      { certs: [], subdomains: [] },
+      'collecting',
+      attempt
+    );
+    emitPairUpdate(nextA, latestB, changed);
+  });
+  const crtShTrackerB = createClientCrtShTracker(cleanB, signal, (attempt) => {
+    if (!latestA || !latestB) return;
+    const { record: nextB, changed } = mergeCrtShDataIntoRecord(
+      latestB,
+      { certs: [], subdomains: [] },
+      'collecting',
+      attempt
+    );
+    emitPairUpdate(latestA, nextB, changed);
+  });
+
+  let baseRecordA: WhoisDomainRecord | null = null;
+  let baseRecordB: WhoisDomainRecord | null = null;
 
   // Try server-side consolidated diff endpoint when backend is available, then enrich with pure browser-JS DoH lookups
   if (shouldUseBackendApi()) {
@@ -2957,10 +3686,11 @@ export async function fetchAndCompareWhois(domainA: string, domainB?: string): P
         if (data && data.domainA && data.domainB) {
           backendApiAvailable = true;
           const [enrichedA, enrichedB] = await Promise.all([
-            enrichDomainWithBrowserDns(data.domainA as WhoisDomainRecord),
-            enrichDomainWithBrowserDns(data.domainB as WhoisDomainRecord),
+            enrichDomainWithBrowserDns(data.domainA as WhoisDomainRecord).then(enrichClientCertsIfMissing),
+            enrichDomainWithBrowserDns(data.domainB as WhoisDomainRecord).then(enrichClientCertsIfMissing),
           ]);
-          return computeWhoisDiff(enrichedA, enrichedB);
+          baseRecordA = enrichedA;
+          baseRecordB = enrichedB;
         }
       } else if (res.status === 404 || res.status === 405 || !ct.includes('application/json')) {
         backendApiAvailable = false;
@@ -2968,11 +3698,79 @@ export async function fetchAndCompareWhois(domainA: string, domainB?: string): P
     } catch {}
   }
 
-  // Concurrently fetch and enrich both records client-side
-  const [recordA, recordB] = await Promise.all([
-    fetchDomainWhois(cleanA),
-    fetchDomainWhois(cleanB),
-  ]);
+  if (!baseRecordA || !baseRecordB) {
+    const [recordA, recordB] = await Promise.all([
+      fetchDomainWhois(cleanA),
+      fetchDomainWhois(cleanB),
+    ]);
+    baseRecordA = recordA;
+    baseRecordB = recordB;
+  }
 
-  return computeWhoisDiff(recordA, recordB);
+  const hasCertDataA = (baseRecordA.crtCertificates?.length || 0) > 0;
+  const hasCertDataB = (baseRecordB.crtCertificates?.length || 0) > 0;
+
+  if (hasCertDataA) {
+    const resolvedA =
+      crtShTrackerA.settled && crtShTrackerA.result
+        ? crtShTrackerA.result
+        : { certs: [], subdomains: [] };
+    crtShTrackerA.stop();
+    baseRecordA = mergeCrtShDataIntoRecord(baseRecordA, resolvedA, 'complete', crtShTrackerA.currentAttempt).record;
+  } else {
+    crtShTrackerA.setShouldPersistRetry((baseRecordA.crtSubdomainsCount || 0) > 0);
+    if (crtShTrackerA.settled && crtShTrackerA.result) {
+      baseRecordA = mergeCrtShDataIntoRecord(baseRecordA, crtShTrackerA.result, 'complete', crtShTrackerA.currentAttempt).record;
+    } else {
+      baseRecordA = { ...baseRecordA, crtShStatus: 'collecting', crtShAttempt: crtShTrackerA.currentAttempt };
+    }
+  }
+
+  if (hasCertDataB) {
+    const resolvedB =
+      crtShTrackerB.settled && crtShTrackerB.result
+        ? crtShTrackerB.result
+        : { certs: [], subdomains: [] };
+    crtShTrackerB.stop();
+    baseRecordB = mergeCrtShDataIntoRecord(baseRecordB, resolvedB, 'complete', crtShTrackerB.currentAttempt).record;
+  } else {
+    crtShTrackerB.setShouldPersistRetry((baseRecordB.crtSubdomainsCount || 0) > 0);
+    if (crtShTrackerB.settled && crtShTrackerB.result) {
+      baseRecordB = mergeCrtShDataIntoRecord(baseRecordB, crtShTrackerB.result, 'complete', crtShTrackerB.currentAttempt).record;
+    } else {
+      baseRecordB = { ...baseRecordB, crtShStatus: 'collecting', crtShAttempt: crtShTrackerB.currentAttempt };
+    }
+  }
+
+  latestA = baseRecordA;
+  latestB = baseRecordB;
+
+  if (onUpdate && !signal?.aborted) {
+    if (!crtShTrackerA.settled && !hasCertDataA) {
+      void crtShTrackerA.promise.then((crtShA) => {
+        if (!latestA || !latestB) return;
+        const { record: nextA, changed } = mergeCrtShDataIntoRecord(
+          latestA,
+          crtShA,
+          'complete',
+          crtShTrackerA.currentAttempt
+        );
+        emitPairUpdate(nextA, latestB, changed);
+      });
+    }
+    if (!crtShTrackerB.settled && !hasCertDataB) {
+      void crtShTrackerB.promise.then((crtShB) => {
+        if (!latestA || !latestB) return;
+        const { record: nextB, changed } = mergeCrtShDataIntoRecord(
+          latestB,
+          crtShB,
+          'complete',
+          crtShTrackerB.currentAttempt
+        );
+        emitPairUpdate(latestA, nextB, changed);
+      });
+    }
+  }
+
+  return computeWhoisDiff(baseRecordA, baseRecordB);
 }

@@ -92,7 +92,6 @@ function parseSoaRname(rawRname: string): string {
  * Parses RFC 1035 SOA record string returned by DoH JSON.
  */
 function parseSoaRecord(data: string): {
-  raw: string;
   mname?: string;
   rname?: string;
   serial?: string;
@@ -100,12 +99,12 @@ function parseSoaRecord(data: string): {
   const clean = data.trim();
   const parts = clean.split(/\s+/);
   if (parts.length < 2) {
-    return { raw: clean };
+    return {};
   }
   const mname = parts[0].replace(/\.$/, '').toLowerCase();
   const rname = parseSoaRname(parts[1]);
   const serial = parts[2] && /^\d+$/.test(parts[2]) ? parts[2] : undefined;
-  return { raw: clean, mname, rname, serial };
+  return { mname, rname, serial };
 }
 
 /**
@@ -367,14 +366,12 @@ export async function enrichDomainWithBrowserDns(record: WhoisDomainRecord): Pro
     ...(rootSoaRes.Answer || []).filter((a) => a.type === 6),
     ...(rootSoaRes.Authority || []).filter((a) => a.type === 6),
   ];
-  let soaRecord = record.soaRecord;
   let soaMname = record.soaMname;
   let soaRname = record.soaRname;
   let soaSerial = record.soaSerial;
 
   if (soaAnswers.length > 0 && soaAnswers[0].data) {
     const parsedSoa = parseSoaRecord(soaAnswers[0].data);
-    soaRecord = parsedSoa.raw;
     soaMname = parsedSoa.mname;
     soaRname = parsedSoa.rname;
     soaSerial = parsedSoa.serial;
@@ -513,7 +510,6 @@ export async function enrichDomainWithBrowserDns(record: WhoisDomainRecord): Pro
 
   return {
     ...record,
-    soaRecord,
     soaMname,
     soaRname,
     soaSerial,

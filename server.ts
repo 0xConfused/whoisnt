@@ -9,6 +9,7 @@ import { createServer as createViteServer } from 'vite';
 import { canonicalizeJsonStringify } from './src/utils/jsonSort';
 import { parseFlexibleDateMs } from './src/utils/dateUtils';
 import { sanitizeDomainInput, isValidDomainFormat, extractApexDomain, prioritizeSubdomainsForRecon } from './src/utils/urlUtils';
+import type { CtCertificateEntry } from './src/types';
 import {
   analyzeHtmlRecon,
   extractAnalyticsIdsFromText,
@@ -1598,51 +1599,227 @@ function inferMailProvider(mxRecords: string[]): string {
   return 'Private / Dedicated Mail Gateway';
 }
 
+const certIssuanceCache = new Map<string, { certs: CtCertificateEntry[]; subdomains: string[]; timestamp: number }>();
+
+function parseIssuerDistinguishedName(issuerName: string): { issuerOrg?: string; issuerCn?: string } {
+  const orgMatch = issuerName.match(/(?:^|,\s*)O=([^,]+)/i);
+  const cnMatch = issuerName.match(/(?:^|,\s*)CN=([^,]+)/i);
+  return {
+    issuerOrg: orgMatch?.[1]?.trim() || undefined,
+    issuerCn: cnMatch?.[1]?.trim() || undefined,
+  };
+}
+
+function finalizeCertificateList(entries: CtCertificateEntry[]): CtCertificateEntry[] {
+  const dedup = new Map<string, CtCertificateEntry>();
+  for (const entry of entries) {
+    if (!entry.dnsNames || entry.dnsNames.length === 0) continue;
+    const key =
+      (entry.sha256 ? entry.sha256.toLowerCase() : '') ||
+      (entry.id ? `id:${entry.id}` : '') ||
+      `${entry.issuerOrg || ''}|${entry.notBefore || ''}|${entry.notAfter || ''}|${entry.dnsNames.join(',')}`;
+    if (!dedup.has(key)) {
+      dedup.set(key, entry);
+    }
+  }
+  return Array.from(dedup.values())
+    .sort((a, b) => {
+      const tA = a.notBefore ? Date.parse(a.notBefore) || 0 : 0;
+      const tB = b.notBefore ? Date.parse(b.notBefore) || 0 : 0;
+      return tB - tA;
+    })
+    .slice(0, 80);
+}
+
+async function fetchServerCertIssuances(
+  apexDomain: string,
+  userAgent: string
+): Promise<{ certs: CtCertificateEntry[]; subdomains: string[] }> {
+  const cached = certIssuanceCache.get(apexDomain);
+  if (cached && Date.now() - cached.timestamp < 10 * 60 * 1000) {
+    return { certs: cached.certs, subdomains: cached.subdomains };
+  }
+
+  const parsedCerts: CtCertificateEntry[] = [];
+  const subSet = new Set<string>();
+
+  const filterHost = (rawName: string): string | null => {
+    const cleaned = String(rawName || '').toLowerCase().trim().replace(/^\.+|\.+$/g, '');
+    if (!cleaned) return null;
+    const base = cleaned.startsWith('*.') ? cleaned.slice(2) : cleaned;
+    if (!base || (base !== apexDomain && !base.endsWith(`.${apexDomain}`))) return null;
+    return cleaned;
+  };
+
+  if (isValidDomainFormat(apexDomain) && !isPrivateOrLocalHost(apexDomain)) {
+    // Primary per-certificate CT source: Certspotter Issuances API
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      const res = await safeFetch(
+        `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(apexDomain)}&include_subdomains=true&expand=dns_names&expand=issuer`,
+        {
+          signal: controller.signal,
+          headers: { Accept: 'application/json', 'User-Agent': userAgent },
+          maxRedirects: 2,
+        }
+      );
+      clearTimeout(timeout);
+      if (res.ok) {
+        const items = await res.json();
+        if (Array.isArray(items)) {
+          for (const item of items) {
+            if (!Array.isArray(item?.dns_names)) continue;
+            const dnsSet = new Set<string>();
+            for (const rawName of item.dns_names) {
+              const cleaned = filterHost(String(rawName));
+              if (cleaned) {
+                dnsSet.add(cleaned);
+                subSet.add(cleaned);
+              }
+            }
+            if (dnsSet.size === 0) continue;
+
+            const issuerName = String(item.issuer?.name || '');
+            const parsedDn = parseIssuerDistinguishedName(issuerName);
+            const issuerOrg = parsedDn.issuerOrg || (typeof item.issuer?.friendly_name === 'string' ? item.issuer.friendly_name.trim() : undefined);
+            const sha256 =
+              typeof item.tbs_sha256 === 'string'
+                ? item.tbs_sha256
+                : typeof item.cert_sha256 === 'string'
+                ? item.cert_sha256
+                : undefined;
+
+            parsedCerts.push({
+              id: String(item.id || sha256 || parsedCerts.length + 1),
+              issuerOrg,
+              issuerCn: parsedDn.issuerCn,
+              notBefore: typeof item.not_before === 'string' ? item.not_before : undefined,
+              notAfter: typeof item.not_after === 'string' ? item.not_after : undefined,
+              revoked: Boolean(item.revoked),
+              sha256,
+              dnsNames: Array.from(dnsSet).sort(),
+            });
+          }
+        }
+      }
+    } catch {}
+
+    // Non-blocking background crt.sh fallback (3 tries, 16s timeout per try) so crt.name prepopulates immediately
+    if (parsedCerts.length === 0) {
+      void (async () => {
+        const crtShCerts: CtCertificateEntry[] = [];
+        const crtShSubs = new Set<string>();
+        const MAX_ATTEMPTS = 3;
+        const ATTEMPT_TIMEOUT_MS = 16000;
+
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
+          try {
+            const res = await safeFetch(
+              `https://crt.sh/?q=${encodeURIComponent(`%.${apexDomain}`)}&output=json`,
+              {
+                signal: controller.signal,
+                headers: { Accept: 'application/json', 'User-Agent': userAgent },
+                maxRedirects: 2,
+              }
+            );
+            clearTimeout(timeout);
+            if (res.ok) {
+              const text = await readBoundedResponseText(res, 2 * 1024 * 1024);
+              const items = JSON.parse(text);
+              if (Array.isArray(items)) {
+                for (const item of items.slice(0, 200)) {
+                  const rawNames = String(item?.name_value || item?.common_name || '')
+                    .split(/[\r\n,]+/)
+                    .map((s) => s.trim())
+                    .filter(Boolean);
+                  const dnsSet = new Set<string>();
+                  for (const rawName of rawNames) {
+                    const cleaned = filterHost(rawName);
+                    if (cleaned) {
+                      dnsSet.add(cleaned);
+                      crtShSubs.add(cleaned);
+                    }
+                  }
+                  if (dnsSet.size === 0) continue;
+
+                  const issuerName = String(item?.issuer_name || '');
+                  const parsedDn = parseIssuerDistinguishedName(issuerName);
+                  const normDate = (v: unknown) => {
+                    if (typeof v !== 'string') return undefined;
+                    const t = v.trim();
+                    return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(t) ? `${t}Z` : t || undefined;
+                  };
+                  crtShCerts.push({
+                    id: String(item?.id || crtShCerts.length + 1),
+                    issuerOrg: parsedDn.issuerOrg,
+                    issuerCn: parsedDn.issuerCn,
+                    notBefore: normDate(item?.not_before),
+                    notAfter: normDate(item?.not_after),
+                    dnsNames: Array.from(dnsSet).sort(),
+                  });
+                }
+
+                const finalized = finalizeCertificateList(crtShCerts);
+                const subs = Array.from(crtShSubs).sort();
+                if (finalized.length > 0 || subs.length > 0) {
+                  certIssuanceCache.set(apexDomain, { certs: finalized, subdomains: subs, timestamp: Date.now() });
+                }
+                return;
+              }
+            }
+          } catch {
+            clearTimeout(timeout);
+          }
+
+          if (attempt < MAX_ATTEMPTS) {
+            await new Promise((r) => setTimeout(r, attempt === 1 ? 1500 : 3000));
+          }
+        }
+      })().catch(() => {});
+    }
+  }
+
+  const certs = finalizeCertificateList(parsedCerts);
+  const subdomains = Array.from(subSet).sort();
+  if (certs.length > 0 || subdomains.length > 0) {
+    certIssuanceCache.set(apexDomain, { certs, subdomains, timestamp: Date.now() });
+  }
+  return { certs, subdomains };
+}
+
 async function getCrtSubdomainSummary(apexDomain: string, userAgent: string): Promise<{
   crtSubdomainsCount: number;
   crtSubdomainsSample: string[];
   allSubdomains: string[];
   crtWildcardFound: boolean;
+  crtCertificates: CtCertificateEntry[];
 }> {
   try {
-    const crtData = await fetchCrtNameSubdomains(apexDomain, userAgent, 4500);
-    let subdomains: string[] = Array.isArray(crtData?.subdomains) ? crtData.subdomains : [];
+    const [crtRes, certIssuanceRes] = await Promise.allSettled([
+      fetchCrtNameSubdomains(apexDomain, userAgent, 4500),
+      fetchServerCertIssuances(apexDomain, userAgent),
+    ]);
 
-    // Fallback to Certspotter CT API if crt.name returned no subdomains
-    if (subdomains.length === 0 && isValidDomainFormat(apexDomain) && !isPrivateOrLocalHost(apexDomain)) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3500);
-        const res = await safeFetch(
-          `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(apexDomain)}&include_subdomains=true&expand=dns_names`,
-          {
-            signal: controller.signal,
-            headers: { Accept: 'application/json', 'User-Agent': userAgent },
-            maxRedirects: 2,
-          }
-        );
-        clearTimeout(timeout);
-        if (res.ok) {
-          const items = await res.json();
-          if (Array.isArray(items)) {
-            const fallbackSet = new Set<string>();
-            for (const item of items) {
-              if (!Array.isArray(item?.dns_names)) continue;
-              for (const name of item.dns_names) {
-                const cleaned = String(name).toLowerCase().trim().replace(/^\.+|\.+$/g, '');
-                const base = cleaned.startsWith('*.') ? cleaned.slice(2) : cleaned;
-                if (base && (base === apexDomain || base.endsWith(`.${apexDomain}`))) {
-                  fallbackSet.add(cleaned);
-                }
-              }
-            }
-            subdomains = Array.from(fallbackSet).sort();
-          }
-        }
-      } catch {}
+    const crtData = crtRes.status === 'fulfilled' ? crtRes.value : null;
+    const issuanceData =
+      certIssuanceRes.status === 'fulfilled' ? certIssuanceRes.value : { certs: [], subdomains: [] };
+
+    const mergedSubdomainSet = new Set<string>();
+    if (Array.isArray(crtData?.subdomains)) {
+      for (const s of crtData.subdomains) {
+        if (typeof s === 'string' && s.trim()) mergedSubdomainSet.add(s.trim().toLowerCase());
+      }
+    }
+    for (const s of issuanceData.subdomains) {
+      mergedSubdomainSet.add(s);
     }
 
-    const count = typeof crtData?.count === 'number' && crtData.count > 0 ? crtData.count : subdomains.length;
+    const subdomains = Array.from(mergedSubdomainSet).sort();
+    const crtCount = typeof crtData?.count === 'number' && crtData.count > 0 ? crtData.count : 0;
+    const count = Math.max(crtCount, subdomains.length);
     const wildcards = subdomains.filter((s: string) => s.startsWith('*.'));
 
     return {
@@ -1650,6 +1827,7 @@ async function getCrtSubdomainSummary(apexDomain: string, userAgent: string): Pr
       crtSubdomainsSample: subdomains.slice(0, 80),
       allSubdomains: subdomains,
       crtWildcardFound: wildcards.length > 0,
+      crtCertificates: issuanceData.certs,
     };
   } catch {
     return {
@@ -1657,6 +1835,7 @@ async function getCrtSubdomainSummary(apexDomain: string, userAgent: string): Pr
       crtSubdomainsSample: [],
       allSubdomains: [],
       crtWildcardFound: false,
+      crtCertificates: [],
     };
   }
 }
@@ -1863,6 +2042,7 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     crtSubdomainsCount: crtData?.crtSubdomainsCount || 0,
     crtSubdomainsSample: crtData?.crtSubdomainsSample || [],
     crtWildcardFound: crtData?.crtWildcardFound || false,
+    crtCertificates: crtData?.crtCertificates || [],
 
     // OSINT Attribution
     verificationTokens: attributionData?.verificationTokens || [],
@@ -1967,178 +2147,6 @@ const handleWhoisDiff = async (req: express.Request, res: express.Response) => {
 
 app.get('/api/whois-diff', handleWhoisDiff);
 app.post('/api/whois-diff', handleWhoisDiff);
-
-function escapeHtmlAttr(val: string): string {
-  return val
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-function sanitizePreviewHtml(rawHtml: string, baseUrl: string): string {
-  let html = rawHtml;
-
-  // Strip executable and nested-browsing elements completely
-  html = html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script\b[^>]*>[\s\S]*/gi, '')
-    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, '')
-    .replace(/<iframe\b[^>]*\/?>/gi, '')
-    .replace(/<frame\b[^>]*>[\s\S]*?<\/frame>/gi, '')
-    .replace(/<frame\b[^>]*\/?>/gi, '')
-    .replace(/<frameset\b[^>]*>[\s\S]*?<\/frameset>/gi, '')
-    .replace(/<object\b[^>]*>[\s\S]*?<\/object>/gi, '')
-    .replace(/<embed\b[^>]*\/?>/gi, '')
-    .replace(/<applet\b[^>]*>[\s\S]*?<\/applet>/gi, '')
-    .replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject>/gi, '')
-    .replace(/<base\b[^>]*>/gi, '')
-    .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?\s*(?:refresh|content-security-policy|set-cookie)[^>]*>/gi, '')
-    .replace(/<link\b[^>]*\bas\s*=\s*["']?\s*(?:script|worker|sharedworker|serviceworker)[^>]*>/gi, '');
-
-  // Scrub inline event handlers (on*), srcdoc, and dangerous URI schemes inside element tags
-  html = html.replace(/<([a-zA-Z][a-zA-Z0-9:-]*)(\s+[^>]*)?>/g, (fullMatch, tagName: string, rawAttrs?: string) => {
-    if (!rawAttrs) return fullMatch;
-    let attrs = rawAttrs;
-
-    // Remove on* event handler attributes and srcdoc repeatedly to handle adjacent attributes
-    let prev = '';
-    while (attrs !== prev) {
-      prev = attrs;
-      attrs = attrs
-        .replace(/\s+on[a-z0-9_-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-        .replace(/\s+srcdoc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
-    }
-
-    // Neutralize javascript:, vbscript:, or data:text/html in URL-bearing attributes
-    attrs = attrs.replace(
-      /\b(href|src|action|formaction|xlink:href|poster|data)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/gi,
-      (attrMatch, attrName: string, _quoted: string, dVal?: string, sVal?: string, uVal?: string) => {
-        const rawVal = (dVal ?? sVal ?? uVal ?? '').replace(/[\u0000-\u0020]+/g, '').toLowerCase();
-        if (
-          rawVal.startsWith('javascript:') ||
-          rawVal.startsWith('vbscript:') ||
-          rawVal.startsWith('data:text/html') ||
-          rawVal.startsWith('data:application/xhtml')
-        ) {
-          return `${attrName}="about:blank"`;
-        }
-        return attrMatch;
-      }
-    );
-
-    const selfClosing = rawAttrs.trimEnd().endsWith('/') ? '/' : '';
-    const cleanedAttrs = attrs.replace(/\/\s*$/, '');
-    return `<${tagName}${cleanedAttrs}${selfClosing}>`;
-  });
-
-  let safeBaseTag = '';
-  try {
-    const parsedBase = new URL(baseUrl);
-    if (parsedBase.protocol === 'http:' || parsedBase.protocol === 'https:') {
-      safeBaseTag = `<base href="${escapeHtmlAttr(parsedBase.href)}">`;
-    }
-  } catch {}
-
-  const cspMeta =
-    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'none\'; object-src \'none\'; base-uri https: http:; style-src \'unsafe-inline\' https: http:; font-src https: http: data:; img-src https: http: data:; media-src \'none\'; frame-src \'none\'; connect-src \'none\'; form-action \'none\';">';
-  const readOnlyStyle =
-    '<style>a,button,input,select,textarea,form{pointer-events:none!important;}</style>';
-  const headInjection = `${cspMeta}${safeBaseTag}${readOnlyStyle}`;
-
-  if (/<head\b[^>]*>/i.test(html)) {
-    return html.replace(/<head\b[^>]*>/i, (m) => `${m}${headInjection}`);
-  }
-  if (/<html\b[^>]*>/i.test(html)) {
-    return html.replace(/<html\b[^>]*>/i, (m) => `${m}<head>${headInjection}</head>`);
-  }
-  return `<!doctype html><html><head><meta charset="utf-8">${headInjection}</head><body>${html}</body></html>`;
-}
-
-app.get('/api/preview', async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-
-  const rawDomain = req.query.domain;
-  if (typeof rawDomain !== 'string' || !rawDomain.trim()) {
-    return res.status(400).json({ error: 'Domain parameter is required' });
-  }
-
-  const clean = sanitizeDomainInput(rawDomain);
-
-  if (!clean || !isValidDomainFormat(clean) || isPrivateOrLocalHost(clean)) {
-    return res.status(400).json({ error: 'Invalid or disallowed domain parameter. Only valid public domain names are permitted.' });
-  }
-
-  const userAgent = getUserAgent(req);
-  let targetRes: Response | null = null;
-  let attemptUrl = `https://${clean}`;
-
-  for (const scheme of ['https', 'http']) {
-    attemptUrl = `${scheme}://${clean}`;
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 6000);
-      const r = await safeFetch(attemptUrl, {
-        method: 'GET',
-        headers: {
-          'User-Agent': userAgent,
-          Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
-        },
-        signal: controller.signal,
-        maxRedirects: 4,
-      });
-      clearTimeout(timeout);
-      targetRes = r;
-      break;
-    } catch {
-      targetRes = null;
-    }
-  }
-
-  if (!targetRes) {
-    return res.status(502).json({ error: `Unable to connect to ${clean} over HTTPS or HTTP.` });
-  }
-
-  const finalUrl = ((targetRes as any).finalUrl as string) || targetRes.url || attemptUrl;
-  const contentType = (targetRes.headers.get('content-type') || '').toLowerCase();
-  const isHtmlLike =
-    !contentType ||
-    contentType.includes('text/html') ||
-    contentType.includes('application/xhtml') ||
-    contentType.includes('text/plain');
-
-  if (!isHtmlLike) {
-    try {
-      await targetRes.body?.cancel();
-    } catch {}
-    return res.status(415).json({
-      error: `Target returned non-HTML content (${contentType.split(';')[0] || 'unknown'}).`,
-      statusCode: targetRes.status,
-      finalUrl,
-    });
-  }
-
-  try {
-    const rawHtml = await readBoundedResponseText(targetRes, MAX_HTML_RECON_BYTES);
-    if (!rawHtml.trim()) {
-      return res.status(502).json({
-        error: `Target returned an empty response body (HTTP ${targetRes.status}).`,
-        statusCode: targetRes.status,
-        finalUrl,
-      });
-    }
-    const sanitizedHtml = sanitizePreviewHtml(rawHtml, finalUrl);
-    return res.json({
-      html: sanitizedHtml,
-      finalUrl,
-      statusCode: targetRes.status,
-    });
-  } catch (err: any) {
-    return res.status(502).json({ error: err?.message || 'Failed to read target HTML for preview.' });
-  }
-});
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

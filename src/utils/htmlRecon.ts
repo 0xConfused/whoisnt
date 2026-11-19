@@ -50,7 +50,7 @@ const ALLOWED_RESPONSE_HEADERS = new Set([
   'x-wix-request-id',
 ]);
 
-export interface StaticHtmlReconResult {
+interface StaticHtmlReconResult {
   httpHeaderSummary: string[];
   cspExternalDomains: string[];
   htmlTitle?: string;
@@ -953,7 +953,7 @@ export interface SubdomainWebProbeEntry {
   fallbackHeaders?: string[];
 }
 
-export interface AggregatedWebReconResult {
+interface AggregatedWebReconResult {
   httpWebServer?: string;
   httpStatusCode?: number;
   httpHeaderSummary?: string[];

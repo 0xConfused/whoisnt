@@ -6,6 +6,17 @@ export interface VerificationTokenItem {
   raw: string;
 }
 
+export interface CtCertificateEntry {
+  id: string;
+  issuerOrg?: string;
+  issuerCn?: string;
+  notBefore?: string;
+  notAfter?: string;
+  revoked?: boolean;
+  sha256?: string;
+  dnsNames: string[];
+}
+
 export interface WhoisDomainRecord {
   domainName: string;
   rootDomain: string;
@@ -34,7 +45,6 @@ export interface WhoisDomainRecord {
   aRecords?: string[];
   aaaaRecords?: string[];
   mailProvider?: string;
-  soaRecord?: string;
   soaMname?: string;
   soaRname?: string;
   soaSerial?: string;
@@ -66,10 +76,13 @@ export interface WhoisDomainRecord {
   tlsValidityNotBefore?: string;
   tlsValidityNotAfter?: string;
 
-  // OSINT: Certificate Transparency (crt.name / Certspotter)
+  // OSINT: Certificate Transparency (crt.name / Certspotter / crt.sh)
   crtSubdomainsCount?: number;
   crtSubdomainsSample?: string[];
   crtWildcardFound?: boolean;
+  crtCertificates?: CtCertificateEntry[];
+  crtShStatus?: 'idle' | 'collecting' | 'complete';
+  crtShAttempt?: number;
 
   // OSINT: Attribution & Verification Fingerprints
   verificationTokens?: VerificationTokenItem[];
