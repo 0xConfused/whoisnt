@@ -10,6 +10,8 @@ interface WhoisDiffInputProps {
   domainB: string;
   onChangeDomainA: (val: string) => void;
   onChangeDomainB: (val: string) => void;
+  disableDirectProbes: boolean;
+  onToggleDisableDirectProbes: (checked: boolean) => void;
   onCompare: () => void;
   isLoading: boolean;
   error?: string | null;
@@ -20,6 +22,8 @@ export const WhoisDiffInput: React.FC<WhoisDiffInputProps> = ({
   domainB,
   onChangeDomainA,
   onChangeDomainB,
+  disableDirectProbes,
+  onToggleDisableDirectProbes,
   onCompare,
   isLoading,
   error,
@@ -100,8 +104,26 @@ export const WhoisDiffInput: React.FC<WhoisDiffInputProps> = ({
             />
           </div>
 
-          {/* Search Button */}
-          <div className="shrink-0 self-end md:self-auto pt-0 md:pt-4">
+          {/* Probe Mode Toggle & Search Button */}
+          <div className="shrink-0 self-end md:self-auto pt-0 md:pt-4 flex items-center gap-2">
+            <button
+              id="disable-direct-probes-toggle"
+              type="button"
+              role="switch"
+              aria-checked={!disableDirectProbes}
+              aria-label={disableDirectProbes ? 'Direct website probes disabled (NO PROBE)' : 'Direct website probes enabled (DIRECT PROBE)'}
+              title={disableDirectProbes ? 'Direct website probes disabled (passive OSINT only)' : 'Direct website probes enabled'}
+              onClick={() => onToggleDisableDirectProbes(!disableDirectProbes)}
+              disabled={isLoading}
+              className={`h-10 min-w-[122px] px-3.5 text-xs font-mono font-bold flex items-center justify-center border transition-colors cursor-pointer uppercase tracking-wider rounded-none whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed ${
+                !disableDirectProbes
+                  ? 'bg-[#1a1a1a] text-[#f0f0f0] border-[#c30800]'
+                  : 'bg-[#0d0d0d] text-[#8c8c8c] border-[#383838] hover:text-[#f0f0f0] hover:border-[#6b665a]'
+              }`}
+            >
+              <span>{disableDirectProbes ? 'NO PROBE' : 'DIRECT PROBE'}</span>
+            </button>
+
             <button
               id="whois-search-btn"
               type="button"

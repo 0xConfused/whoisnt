@@ -1840,7 +1840,7 @@ async function getCrtSubdomainSummary(apexDomain: string, userAgent: string): Pr
   }
 }
 
-async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Promise<any> {
+async function buildServerWhoisRecord(rawDomain: string, userAgent: string, disableDirectProbes = false): Promise<any> {
   const cleanDomain = rawDomain.toLowerCase().trim().replace(/:\d+$/, '').replace(/^\.+|\.+$/g, '');
   const rootDomain = extractApexDomain(cleanDomain);
 
@@ -1862,7 +1862,7 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
       fetchDnsOverHttps(cleanDomain, 'DS', userAgent),
     ]),
     extractAttributionAndVerification(cleanDomain),
-    inspectLiveTlsCert(cleanDomain),
+    disableDirectProbes ? Promise.resolve(null) : inspectLiveTlsCert(cleanDomain),
     getCrtSubdomainSummary(rootDomain, userAgent),
     fetchHackerTargetZone(rootDomain, userAgent),
   ]);
@@ -1879,7 +1879,9 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
 
   // Phase 2: Search discovered subdomains for Web Recon and Passive DNS
   const [webProbeResult, passiveDnsResult] = await Promise.allSettled([
-    probeWebPageAndHeaders(cleanDomain, userAgent, discoveredSubdomains),
+    disableDirectProbes
+      ? Promise.resolve(null)
+      : probeWebPageAndHeaders(cleanDomain, userAgent, discoveredSubdomains),
     fetchServerPassiveDns(rootDomain, userAgent, discoveredSubdomains, htData?.records || []),
   ]);
 
@@ -1983,7 +1985,7 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
   const webData = webProbeResult.status === 'fulfilled' ? webProbeResult.value : null;
   const pdnsData = passiveDnsResult.status === 'fulfilled' ? passiveDnsResult.value : null;
 
-  if (!tlsData?.tlsIssuerCn && !tlsData?.tlsSubjectCn) {
+  if (!disableDirectProbes && !tlsData?.tlsIssuerCn && !tlsData?.tlsSubjectCn) {
     const fallbackTlsHost = webData?.webReconReachableHosts?.find((h) => h !== cleanDomain);
     if (fallbackTlsHost && isValidDomainFormat(fallbackTlsHost) && !isPrivateOrLocalHost(fallbackTlsHost)) {
       try {
@@ -2060,11 +2062,11 @@ async function buildServerWhoisRecord(rawDomain: string, userAgent: string): Pro
     httpStatusCode: webData?.httpStatusCode,
     httpHeaderSummary: webData?.httpHeaderSummary || [],
     cspExternalDomains: webData?.cspExternalDomains || [],
-    webReconMode: webData?.webReconMode,
+    webReconMode: disableDirectProbes ? 'disabled' : webData?.webReconMode,
     webFinalUrl: webData?.webFinalUrl,
     inspectedScriptsCount: webData?.inspectedScriptsCount || 0,
-    webReconProbedHostsCount: webData?.webReconProbedHostsCount,
-    webReconReachableHosts: webData?.webReconReachableHosts || [],
+    webReconProbedHostsCount: disableDirectProbes ? 0 : webData?.webReconProbedHostsCount,
+    webReconReachableHosts: disableDirectProbes ? [] : webData?.webReconReachableHosts || [],
     htmlTitle: webData?.htmlTitle,
     htmlDescription: webData?.htmlDescription,
     htmlGenerator: webData?.htmlGenerator,
@@ -2097,9 +2099,11 @@ app.get('/api/whois', async (req, res) => {
     return res.status(400).json({ error: 'Invalid or disallowed domain parameter. Only valid public domain names are permitted.' });
   }
 
+  const disableDirectProbes = req.query.disableDirectProbes === '1' || req.query.disableDirectProbes === 'true';
+
   try {
     const userAgent = getUserAgent(req);
-    const record = await buildServerWhoisRecord(clean, userAgent);
+    const record = await buildServerWhoisRecord(clean, userAgent, disableDirectProbes);
     res.json(record);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'WHOIS lookup failed' });
@@ -2109,6 +2113,8 @@ app.get('/api/whois', async (req, res) => {
 const handleWhoisDiff = async (req: express.Request, res: express.Response) => {
   const domainA = req.query.domainA ?? req.body?.domainA;
   const domainB = req.query.domainB ?? req.body?.domainB;
+  const rawDisableProbes = req.query.disableDirectProbes ?? req.body?.disableDirectProbes;
+  const disableDirectProbes = rawDisableProbes === '1' || rawDisableProbes === 'true' || rawDisableProbes === true;
 
   if (typeof domainA !== 'string' || typeof domainB !== 'string' || !domainA.trim() || !domainB.trim()) {
     return res.status(400).json({ error: 'Both domainA and domainB parameters are required' });
@@ -2131,8 +2137,8 @@ const handleWhoisDiff = async (req: express.Request, res: express.Response) => {
   try {
     const userAgent = getUserAgent(req);
     const [recA, recB] = await Promise.all([
-      buildServerWhoisRecord(cleanA, userAgent),
-      buildServerWhoisRecord(cleanB, userAgent),
+      buildServerWhoisRecord(cleanA, userAgent, disableDirectProbes),
+      buildServerWhoisRecord(cleanB, userAgent, disableDirectProbes),
     ]);
 
     res.json({

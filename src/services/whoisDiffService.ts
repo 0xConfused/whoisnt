@@ -658,6 +658,7 @@ function computeWhoisDiff(domainA: WhoisDomainRecord, domainB: WhoisDomainRecord
   // ==========================================
 
   const formatWebStatus = (d: WhoisDomainRecord) => {
+    if (d.webReconMode === 'disabled') return 'Disabled (Direct website probes disabled)';
     if (d.webReconMode === 'cors-blocked') return 'Blocked by Target CORS Policy (Use backend server for direct inspection)';
     if (d.webReconMode === 'unreachable') return 'Unreachable over HTTP/HTTPS';
     if (!d.httpStatusCode && !d.webFinalUrl) return 'Not available';
@@ -1640,6 +1641,7 @@ function computeSingleDomainResult(domain: WhoisDomainRecord): WhoisDiffResult {
 
   // 3B. WEB RECON & PASSIVE DNS
   const formatWebStatus = (d: WhoisDomainRecord) => {
+    if (d.webReconMode === 'disabled') return 'Disabled (Direct website probes disabled)';
     if (d.webReconMode === 'cors-blocked') return 'Blocked by Target CORS Policy (Use backend server for direct inspection)';
     if (d.webReconMode === 'unreachable') return 'Unreachable over HTTP/HTTPS';
     if (!d.httpStatusCode && !d.webFinalUrl) return 'Not available';
@@ -2762,7 +2764,8 @@ function mergeCrtShDataIntoRecord(
 
 async function fetchClientCtSubdomains(
   rootDomain: string,
-  seedSubdomains: string[] = []
+  seedSubdomains: string[] = [],
+  disableDirectProbes = false
 ): Promise<{
   crtSubdomainsCount: number;
   crtSubdomainsSample: string[];
@@ -2924,7 +2927,7 @@ async function fetchClientCtSubdomains(
   await Promise.all([queryCrtName(), queryCertspotter(), queryHackerTarget()]);
 
   // Fallback in pure browser JS when Certspotter is rate-limited/empty: inspect live leaf certificates via CORS TLS inspector
-  if (rawCerts.length === 0) {
+  if (!disableDirectProbes && rawCerts.length === 0) {
     const liveCerts = await fetchBrowserTlsCertsViaCorsInspector(
       cleanApex,
       Array.from(subs),
@@ -3197,7 +3200,7 @@ async function probeClientWebPageAndHeaders(cleanDomain: string, discoveredSubs:
 }
 
 // Fallback Browser RDAP, DoH & OSINT Query (used on GitHub Pages static hosting or when backend is unavailable)
-async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> {
+async function fetchClientSideWhois(domain: string, disableDirectProbes = false): Promise<WhoisDomainRecord> {
   const clean = sanitizeDomainInput(domain);
   const root = extractApexDomain(clean) || clean;
   const tld = root.split('.').pop() || '';
@@ -3262,13 +3265,19 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
     queryBrowserDoh(clean, 'AAAA'),
     queryBrowserDoh(clean, 'MX'),
     queryBrowserDoh(root, 'DS'),
-    fetchClientCtSubdomains(root),
+    fetchClientCtSubdomains(root, [], disableDirectProbes),
   ]);
 
   // Phase 2: Search all discovered subdomains for Passive DNS & Web Recon
   const [pdnsData, webData] = await Promise.all([
     fetchClientPassiveDns(clean, root, ctData.allSubdomains, ctData.hackerTargetRecords),
-    probeClientWebPageAndHeaders(clean, ctData.allSubdomains),
+    disableDirectProbes
+      ? Promise.resolve<Partial<WhoisDomainRecord>>({
+          webReconMode: 'disabled',
+          webReconProbedHostsCount: 0,
+          webReconReachableHosts: [],
+        })
+      : probeClientWebPageAndHeaders(clean, ctData.allSubdomains),
   ]);
 
   if (rdapData) {
@@ -3479,14 +3488,15 @@ async function fetchClientSideWhois(domain: string): Promise<WhoisDomainRecord> 
   };
 }
 
-async function enrichClientCertsIfMissing(record: WhoisDomainRecord): Promise<WhoisDomainRecord> {
+async function enrichClientCertsIfMissing(record: WhoisDomainRecord, disableDirectProbes = false): Promise<WhoisDomainRecord> {
   if (record.crtCertificates && record.crtCertificates.length > 0) {
     return record;
   }
   try {
     const ctFallback = await fetchClientCtSubdomains(
       record.rootDomain || record.domainName,
-      record.crtSubdomainsSample || []
+      record.crtSubdomainsSample || [],
+      disableDirectProbes
     );
     if (ctFallback.crtCertificates.length === 0) {
       return record;
@@ -3510,7 +3520,7 @@ async function enrichClientCertsIfMissing(record: WhoisDomainRecord): Promise<Wh
   }
 }
 
-async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
+async function fetchDomainWhois(domain: string, disableDirectProbes = false): Promise<WhoisDomainRecord> {
   const clean = sanitizeDomainInput(domain);
   if (!isValidDomainFormat(clean)) {
     throw new Error('Invalid or disallowed domain syntax. Please enter a valid public domain name.');
@@ -3520,7 +3530,8 @@ async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 24000);
-      const res = await fetch(`/api/whois?domain=${encodeURIComponent(clean)}`, {
+      const probeParam = disableDirectProbes ? '&disableDirectProbes=1' : '';
+      const res = await fetch(`/api/whois?domain=${encodeURIComponent(clean)}${probeParam}`, {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
       });
@@ -3532,7 +3543,7 @@ async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
         if (data && data.domainName) {
           backendApiAvailable = true;
           const enriched = await enrichDomainWithBrowserDns(data as WhoisDomainRecord);
-          return enrichClientCertsIfMissing(enriched);
+          return enrichClientCertsIfMissing(enriched, disableDirectProbes);
         }
       } else if (res.status === 404 || res.status === 405 || !ct.includes('application/json')) {
         backendApiAvailable = false;
@@ -3542,7 +3553,7 @@ async function fetchDomainWhois(domain: string): Promise<WhoisDomainRecord> {
     }
   }
 
-  const clientRecord = await fetchClientSideWhois(clean);
+  const clientRecord = await fetchClientSideWhois(clean, disableDirectProbes);
   return enrichDomainWithBrowserDns(clientRecord);
 }
 
@@ -3550,7 +3561,8 @@ export async function fetchAndCompareWhois(
   domainA: string,
   domainB?: string,
   onUpdate?: (updatedResult: WhoisDiffResult) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  disableDirectProbes = false
 ): Promise<WhoisDiffResult> {
   const cleanA = sanitizeDomainInput(domainA || '');
   const cleanB = sanitizeDomainInput(domainB || '');
@@ -3584,7 +3596,7 @@ export async function fetchAndCompareWhois(
       }
     });
 
-    const record = await fetchDomainWhois(singleDomain);
+    const record = await fetchDomainWhois(singleDomain, disableDirectProbes);
     const hasRetrievedCertData = (record.crtCertificates?.length || 0) > 0;
 
     if (hasRetrievedCertData) {
@@ -3674,10 +3686,14 @@ export async function fetchAndCompareWhois(
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 30000);
-      const res = await fetch(`/api/whois-diff?domainA=${encodeURIComponent(cleanA)}&domainB=${encodeURIComponent(cleanB)}`, {
-        signal: controller.signal,
-        headers: { Accept: 'application/json' },
-      });
+      const probeParam = disableDirectProbes ? '&disableDirectProbes=1' : '';
+      const res = await fetch(
+        `/api/whois-diff?domainA=${encodeURIComponent(cleanA)}&domainB=${encodeURIComponent(cleanB)}${probeParam}`,
+        {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        }
+      );
       clearTimeout(timeout);
 
       const ct = res.headers.get('content-type') || '';
@@ -3686,8 +3702,12 @@ export async function fetchAndCompareWhois(
         if (data && data.domainA && data.domainB) {
           backendApiAvailable = true;
           const [enrichedA, enrichedB] = await Promise.all([
-            enrichDomainWithBrowserDns(data.domainA as WhoisDomainRecord).then(enrichClientCertsIfMissing),
-            enrichDomainWithBrowserDns(data.domainB as WhoisDomainRecord).then(enrichClientCertsIfMissing),
+            enrichDomainWithBrowserDns(data.domainA as WhoisDomainRecord).then((r) =>
+              enrichClientCertsIfMissing(r, disableDirectProbes)
+            ),
+            enrichDomainWithBrowserDns(data.domainB as WhoisDomainRecord).then((r) =>
+              enrichClientCertsIfMissing(r, disableDirectProbes)
+            ),
           ]);
           baseRecordA = enrichedA;
           baseRecordB = enrichedB;
@@ -3700,8 +3720,8 @@ export async function fetchAndCompareWhois(
 
   if (!baseRecordA || !baseRecordB) {
     const [recordA, recordB] = await Promise.all([
-      fetchDomainWhois(cleanA),
-      fetchDomainWhois(cleanB),
+      fetchDomainWhois(cleanA, disableDirectProbes),
+      fetchDomainWhois(cleanB, disableDirectProbes),
     ]);
     baseRecordA = recordA;
     baseRecordB = recordB;

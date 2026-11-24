@@ -75,6 +75,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<OsintViewMode>('matrix');
   const [showExportModal, setShowExportModal] = useState<boolean>(false);
+  const [disableDirectProbes, setDisableDirectProbes] = useState<boolean>(true);
 
   const [, startTransition] = useTransition();
   const tabBarRef = useRef<HTMLDivElement | null>(null);
@@ -113,7 +114,7 @@ export default function App() {
   }, [diffResult]);
 
   const handleCompare = useCallback(
-    async (targetA = domainA, targetB = domainB, syncUrl = true) => {
+    async (targetA = domainA, targetB = domainB, syncUrl = true, overrideDisableProbes = disableDirectProbes) => {
       const cleanA = sanitizeDomainInput(targetA);
       const cleanB = sanitizeDomainInput(targetB);
 
@@ -165,7 +166,8 @@ export default function App() {
               setDiffResult(updatedResult);
             });
           },
-          abortController.signal
+          abortController.signal,
+          overrideDisableProbes
         );
         if (lookupSeqRef.current !== seq || abortController.signal.aborted) return;
         startTransition(() => {
@@ -178,7 +180,7 @@ export default function App() {
         setError(err.message || 'Failed to retrieve authoritative WHOIS & OSINT records.');
       }
     },
-    [domainA, domainB]
+    [domainA, domainB, disableDirectProbes]
   );
 
   const handleCompareRef = useRef(handleCompare);
@@ -244,6 +246,8 @@ export default function App() {
           domainB={domainB}
           onChangeDomainA={handleDomainAChange}
           onChangeDomainB={handleDomainBChange}
+          disableDirectProbes={disableDirectProbes}
+          onToggleDisableDirectProbes={setDisableDirectProbes}
           onCompare={() => handleCompare(domainA, domainB)}
           isLoading={isLoading}
           error={error}

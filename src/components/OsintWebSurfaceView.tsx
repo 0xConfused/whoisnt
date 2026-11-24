@@ -89,7 +89,8 @@ const isUnavailableText = (raw: unknown): boolean => {
     s === 'no external domains discovered' ||
     s === 'unreachable over http/https' ||
     s === 'no reachable subdomains observed' ||
-    s.startsWith('blocked by target cors policy')
+    s.startsWith('blocked by target cors policy') ||
+    s.startsWith('disabled (')
   );
 };
 

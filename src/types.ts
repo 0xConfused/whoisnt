@@ -108,7 +108,7 @@ export interface WhoisDomainRecord {
   httpStatusCode?: number;
   httpHeaderSummary?: string[];
   cspExternalDomains?: string[];
-  webReconMode?: 'server-direct' | 'browser-cors' | 'cors-blocked' | 'unreachable';
+  webReconMode?: 'server-direct' | 'browser-cors' | 'cors-blocked' | 'unreachable' | 'disabled';
   webFinalUrl?: string;
   inspectedScriptsCount?: number;
   webReconProbedHostsCount?: number;
